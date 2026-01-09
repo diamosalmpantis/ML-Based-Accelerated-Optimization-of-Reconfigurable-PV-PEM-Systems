@@ -27,7 +27,7 @@ Correlation Matrices: Analyzing the relationships between environmental inputs (
 
 MCDA Weight Distributions: Boxplots showing CRITIC-derived weight variability.
 
-3. Better_prediction.py (Hybrid Surrogate Model)
+3. Better_prediction_couplinh_1MW.py (Hybrid Surrogate Model)
 The core of the real-time decision framework. It maps environmental features directly to optimal system configurations.
 
 Machine Learning: Utilizes Random Forest Regression to predict PV configurations and PEM temperatures.
@@ -49,6 +49,10 @@ All execution times and benchmarks were recorded on the following hardware:
 Processor: AMD Ryzen 9 7950X3D 16-Core Processor (4.20 GHz).
 
 Optimization Speedup: The surrogate model achieves an 18x speedup for annual horizons and a 900x speedup for next-day forecasts compared to the full physics-based model.
+
+📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 📖 Citation
 If you use this code or methodology in your research, please cite:
