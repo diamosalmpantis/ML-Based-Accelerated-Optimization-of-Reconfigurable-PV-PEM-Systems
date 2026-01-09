@@ -79,11 +79,6 @@ def predict_configuration(input_features, irradiance_threshold=15, temperature_t
         return None
 
     # --- Find nearby points ---
-    # The 'r' parameter in query_ball_point expects a single float radius for a single query point.
-    # It appears the intention was to use different thresholds for different features.
-    # To resolve the ValueError, we combine them into a single radius. Using the maximum
-    # of the two thresholds will ensure the search sphere covers at least the maximum
-    # extent defined by the individual thresholds, allowing for subsequent filtering if needed.
     effective_radius = max(irradiance_threshold, temperature_threshold)
     idxs = kdtree.query_ball_point(input_features, r=effective_radius)
     if len(idxs) == 0:
@@ -1096,3 +1091,4 @@ print(f"Predictions used: {prediction_used_count}")
 end_time = time.time()
 elapsed_time = end_time - start_time
 print(f"Execution time: {elapsed_time/60} mins")
+
