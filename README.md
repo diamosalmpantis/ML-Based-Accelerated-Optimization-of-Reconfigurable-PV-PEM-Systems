@@ -57,4 +57,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 📖 Citation
 If you use this code or methodology in your research, please cite:
 
-[Insert your paper title and DOI here]
+[DOI here]
