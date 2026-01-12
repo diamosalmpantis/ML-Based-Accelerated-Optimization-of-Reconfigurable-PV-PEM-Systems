@@ -1,15 +1,17 @@
 Hybrid Optimization and Surrogate Modeling for HJT-PV/PEM Systems
-This repository contains the computational framework for optimizing and controlling a reconfigurable Heterojunction (HJT) PV–PEM hydrogen production system. The project transitions from high-fidelity, metaheuristic multi-objective optimization to a high-speed hybrid surrogate model capable of real-time operational decision-making.
+
+This repository contains the computational framework for optimizing and controlling a reconfigurable Heterojunction (HJT) PV– Proton Exchange Membrane (PEM) hydrogen production system. The project transitions from high-fidelity, metaheuristic multi-objective optimization to a high-speed hybrid surrogate model capable of real-time operational decision-making.
 
 🚀 Overview
-Directly coupling PV arrays with PEM electrolyzers requires precise configuration to maintain high efficiency under fluctuating weather conditions. This framework addresses two core challenges:
+Directly coupling PV arrays with PEM electrolyzer stack requires precise configuration to maintain high efficiency under fluctuating weather conditions. This framework addresses two core challenges:
 
-Sizing and Trade-off Analysis: Using NSGA-II to explore the feasible design space (PV strings and PEM temperature).
+* Sizing and Trade-off Analysis: Using NSGA-II to explore the feasible design space (PV strings and PEM temperature).
 
-Real-Time Control: Replacing computationally expensive physics-based loops with a Hybrid Surrogate Model that is up to 900x faster for daily forecasting.
+* Real-Time Control: Replacing computationally expensive physics-based loops with a hybrid surrogate model that is up to 18x faster for yearly optimization.
 
-📂 Repository Structure
-1. NSGA-II_application_1MW.py (Metaheuristic Optimization)
+📂 Repository Structure in kW system (similar in 1 MW scalling up)
+
+1. NSGA-II_application.py (Metaheuristic Optimization)
 This script implements the NSGA-II algorithm to identify the Pareto-optimal front for the system.
 
 Degrees of Freedom: Number of parallel HJT PV strings and PEM operating temperature.
@@ -18,30 +20,23 @@ Objectives: Maximizing hydrogen production and STH efficiency while minimizing e
 
 Purpose: Systematic exploration of the search space without requiring predefined weighting factors.
 
-2. NSGA-II plots_1MW.py (Visualizations)
+2. NSGA-II plots.py (Visualizations)
 A dedicated module for generating high-quality visualizations of the optimization results, including:
 
-3D/4D Pareto Fronts: Illustrating the trade-offs between competing objectives.
+3D/2D Pareto Fronts: Illustrating the trade-offs between competing objectives.
 
 Correlation Matrices: Analyzing the relationships between environmental inputs (irradiance) and system performance.
 
 MCDA Weight Distributions: Boxplots showing CRITIC-derived weight variability.
 
-3. Better_prediction_couplinh_1MW.py (Hybrid Surrogate Model)
-The core of the real-time decision framework. It maps environmental features directly to optimal system configurations.
+3. Better_prediction_coupling.py (Hybrid Surrogate Model- Digital Twin)
+The core of the real-time decision framework. It maps environmental features directly to optimal system configurations and PEM operational temperature.
 
-Machine Learning: Utilizes Random Forest Regression to predict PV configurations and PEM temperatures.
+Machine Learning: Utilizes Random Forest Regression to predict PV configurations and PEM temperatures with the help of a k-d-tree acceleration.
 
 Reliability Filter: Employs a k-d tree-based nearest-neighbor search to verify prediction validity against the training database.
 
 Physical Logic: Incorporates rule-based feasibility checks to ensure valid operation under low irradiance or out-of-distribution conditions.
-
-🛠 Methodology
-The workflow follows a two-stage process:
-
-Offline Optimization: NSGA-II evaluates thousands of candidate configurations using physics-based simulations to generate a robust database of optimal solutions.
-
-Online Deployment: The hybrid model learns from this database to provide near-instantaneous recommendations. This avoids the "prohibitively slow" iterative cycles of traditional physics-based methods, enabling responsive control under continuously changing weather.
 
 💻 Performance Baseline
 All execution times and benchmarks were recorded on the following hardware:
