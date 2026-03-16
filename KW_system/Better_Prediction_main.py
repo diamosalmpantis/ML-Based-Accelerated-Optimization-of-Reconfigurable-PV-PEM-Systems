@@ -132,7 +132,7 @@ def predict_configuration(input_features, irradiance_threshold=15, temperature_t
 
 start_time = time.time()
 
-#________________________________________PV Modeling (https://cdn.enfsolar.com/z/pp/2023/4/98i3k570okg9cc6/ecosolifer-144-cells-product-family-430-450w.pdf?utm_source=chatgpt.com)_______________________________________________________________________    
+#________________________________________PV Modeling (https://cdn.enfsolar.com/z/pp/2023/4/98i3k570okg9cc6/ecosolifer-144-cells-product-family-430-450w.pdf)_______________________________________________________________________    
 # Constants
 k = 1.38e-23  # Boltzmann constant (J/K)
 q = 1.6e-19   # Charge of electron (C)
