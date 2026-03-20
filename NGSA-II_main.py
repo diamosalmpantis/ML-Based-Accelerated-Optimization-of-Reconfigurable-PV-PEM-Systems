@@ -1,0 +1,1840 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 17 14:56:35 2026
+
+@author: Diamantis
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import fsolve
+import time
+import sys
+import pvlib
+from pvlib.solarposition import get_solarposition
+from pvlib.location import Location
+from pvlib.atmosphere import get_relative_airmass
+import time
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.termination import get_termination
+from pymoo.operators.sampling.rnd import FloatRandomSampling
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+
+#------------------------------------------------------------
+start_time = time.time()
+
+#________________________________________PV Modeling_______________________________________________________________________
+# Constants
+k = 1.38e-23  # Boltzmann constant (J/K)
+q = 1.6e-19   # Charge of electron (C)
+Ns = 60       # Number of cells in series
+Np = 1        # Number of parallel strings
+
+
+# PV parameters
+Iph_ref = 7.5   # Reference photo-generated current (A) for our pv
+Rs = 0.35       # Series resistance (Ω)
+Rsh = 800      # Shunt resistance (Ω)
+Is_ref1 = 5e-15   # Saturation current for diode 1 (A)
+Is_ref2 = 5e-15   # Saturation current for diode 2 (A)
+Is_refi = 5e-14   # Saturation current due to interface defects (A)
+n1 = 1.1      # Ideality factor for diode 1 - Auger dominated SHJ
+n2 = 1.0      # Ideality factor for diode 2
+ni = 0.85  # Ideality factor for interface defects
+Voc_ref_per_cell = 0.751  # Open-circuit voltage per cell (V)
+Eg = 1.12               # Silicon bandgap (eV)
+T_ref = 25 + 273.15
+NOCT=45
+Eg_ref= 1.12
+alpha = 4.73e-4
+rho_contact =2.5e-3 #Ω*cm2 (p-nc-Si:H/HCO contact resistancy)
+A_cell_pv=243 #cm2
+# Essential missing parameters for SHJ (from research papers)
+aSi_thickness = 6e-9       # a-Si:H(i) layer thickness (5nm) [1]
+TCO_resistivity = 2.5e-4     # ITO sheet resistance (Ω·cm) [7]
+V_oc_temp_coeff = -0.24 /100   # SHJ voltage temp coefficient (%/K) [4]
+j_sc = Iph_ref / A_cell_pv
+N_def = 5e14       # 1e15 m⁻³ defects
+pv_module_area = 1.74  # m^2
+
+# Solar and geographical parameters
+'''Lund, Sweden → Latitude: 55.7° N, Longitude: 13.2° E
+Lund, Czech Republic → Latitude: 50.1° N, Longitude: 14.4° E
+Andorra (Andorra la Vella) → Latitude: 42.5° N, Longitude: 1.5° E'''
+
+latitude = 50.1  # Change this to your location
+longitude = 14.4  # Change this to your location
+tilt_angle_deg = 30  # PV panel tilt angle (adjust as needed)
+sun_zenith_deg=45
+
+#---------------------------------------------Modelling-------------------------------------------------------
+
+# Function to calculate effective irradiance including diffuse and reflected components
+def calculate_effective_irradiance(G, G_rear, tilt_angle_deg, sun_zenith_deg, bifaciality=0.9,  albedo=0.2):
+    tilt_angle_rad = np.radians(tilt_angle_deg)
+    sun_zenith_rad = np.radians(sun_zenith_deg)
+
+    # Direct component
+    G_direct = G * np.cos(tilt_angle_rad - sun_zenith_rad)
+
+    # Diffuse component (approximation for isotropic model)
+    G_diffuse = 0.3 * G  # Assume 30% of total radiation is diffuse
+
+    # Ground-reflected component
+    G_reflected = albedo * G * (1 - np.cos(tilt_angle_rad)) / 2
+
+    # Rear-side effective irradiance (assuming similar ground reflection model)
+    G_rear_effective = G_rear * bifaciality
+
+    return G_direct + G_diffuse + G_reflected +  G_rear_effective
+
+# Function to calculate bifacial gain
+def bifacial_gain(G, G_rear, bifaciality=0.9):
+    return G + bifaciality * G_rear
+
+def bandgap_energy(T):
+    # Example bandgap calculation, not involving calculate_is
+    return Eg_ref * (1 - alpha * (T - T_ref))
+
+'''
+# Example correction for a circular recursion
+def calculate_is(temperature, Is_ref):
+    # Ensure bandgap_energy is calculated without calling calculate_is again
+    Eg_T = bandgap_energy(temperature)
+    # other calculations that don't involve recursion
+    Is = Is_ref * (Eg_T / Eg_ref)  # Adjust as per your model
+    return Is
+'''
+
+def calculate_iph(Iph_ref, G, T_ambient, G_ref=1000, T_ref=25, alpha_Isc=0.0005):
+    return Iph_ref * (G / G_ref) * (1 + alpha_Isc * (T_ambient - T_ref))
+
+# Function to calculate cell temperature from ambient temperature and irradiance
+def calculate_cell_temperature(temperature, G, NOCT=45):
+    return temperature + ((NOCT - 20) / 800) * G  # More accurate NOCT model
+
+
+# Function to calculate total resistance including contact resistivity
+def calculate_total_resistance(Rs, Rsh, rho_contact, A_cell_pv):
+    """Compute total resistance including series, shunt, and contact resistance."""
+    R_contact = rho_contact / A_cell_pv  # Convert resistivity to resistance (Ω)
+    return Rs + R_contact, Rsh  # Return total series and shunt resistance
+
+def adjust_voc_temp(Voc_ref_per_cell, temperature, T_ref, V_oc_temp_coeff):
+    """Adjust open-circuit voltage based on temperature effect."""
+    V_oc_temp_coeff_abs = V_oc_temp_coeff / 100  # Convert %/K to fraction/K
+    return Voc_ref_per_cell * (1 + V_oc_temp_coeff_abs * (temperature - T_ref))
+
+def enhanced_recombination(voltage, temperature, Rs, Rsh, rho_contact, A_cell_pv, aSi_thickness, TCO_resistivity, ni):
+    """Compute recombination current, considering contact resistance, interface defects, and passivation quality."""
+
+    A_cell_m2 = A_cell_pv * 1e-4
+
+    # Contact resistance
+    R_contact = rho_contact / A_cell_pv  # Contact resistance (Ohms)
+    R_total = Rs + R_contact  # Total resistance (series + contact)
+
+    # Surface recombination velocity (S) based on material thickness
+    S = 1e5 * np.exp(-aSi_thickness / 2e-9)  # Surface recombination (m/s)
+
+    Voc_adj = adjust_voc_temp(Voc_ref_per_cell, temperature, T_ref, V_oc_temp_coeff)
+    # Temperature-dependent thermal voltage (Vt)
+    Vt = (k * (temperature + 273.15)) / q   # Thermal voltage in volts
+
+    # Diode ideality factor, ni (typically around 1 for ideal material)
+    exponent = voltage / (ni * Vt)
+
+    # Cap the exponent to avoid overflow (tuning the range here)
+    exponent = np.clip(exponent, -10, 10)  # Avoid large values
+
+    # Defect current due to recombination
+
+    defect_current = 1e-12
+
+
+    # Recombination current using a more realistic approach
+    recombination_current = defect_current * (voltage / R_total) * (1 + S / (TCO_resistivity * A_cell_pv))
+
+
+    return recombination_current
+
+# Function to compute solar position and adjust irradiance
+def get_solar_irradiance(time, latitude, longitude, tilt_angle_deg, G=1000):
+    location = Location(latitude, longitude)
+    solar_position = get_solarposition(time, location.latitude, location.longitude)
+
+    sun_zenith_deg = solar_position['zenith'].values[0]
+    effective_irradiance = calculate_effective_irradiance(G, 0.1*G, tilt_angle_deg, sun_zenith_deg)
+
+    return effective_irradiance
+
+def implied_ff(Voc_adj, j_sc, temperature):
+
+    """Empirical relationship for implied fill factor (FF)."""
+    Vt = (k * (temperature + 273.15)) / q
+    voc_normalized = Voc_adj / (n1 * Vt)  # Dimensionless Voc
+    return (voc_normalized - np.log(voc_normalized + 0.72)) / (voc_normalized + 1)
+
+
+def pv_model(voltage, params, effective_irradiance, rho_contact,  A_cell, aSi_thickness,  TCO_resistivity, ni):
+    # Unpack parameters
+    Iph_ref, Is_ref1, Is_ref2, Is_refi, Rs, Rsh, n1, n2, ni, temperature, rho_contact = params
+
+    # Adjust the photocurrent for irradiance and temperature
+    Iph = calculate_iph(Iph_ref, effective_irradiance, temperature, G_ref=1000, T_ref=25, alpha_Isc=0.0005)
+
+    Voc_adj = adjust_voc_temp(Voc_ref_per_cell, temperature, T_ref, V_oc_temp_coeff)
+    # Compute thermal voltage
+    Vt = (k * (temperature + 273.15)) / q
+
+    # Compute total resistances
+    Rs_total, Rsh_total = calculate_total_resistance(Rs, Rsh, rho_contact, A_cell_pv)
+
+    # Initialize diode currents
+    Id_prev = 0
+
+    while True:
+        # Temperature-dependent saturation currents
+        Is1 = Is_ref1 * ((temperature + 273.15)/T_ref)**3 * np.exp((Eg*q/(n1*k))*(1/T_ref - 1/(temperature + 273.15)))
+        Is2 = Is_ref2 * ((temperature + 273.15)/T_ref)**3 * np.exp((Eg*q/(n2*k))*(1/T_ref - 1/(temperature + 273.15)))
+        Isi = Is_refi * ((temperature + 273.15)/T_ref)**3 * np.exp((Eg*q/(ni*k))*(1/T_ref - 1/(temperature + 273.15)))
+
+        # Compute diode currents
+        Id1 = Is1 * (np.exp((voltage + voltage * Rs_total / Rsh_total) / (n1 * Ns * Vt)) - 1)
+        Id2 = Is2 * (np.exp((voltage + voltage * Rs_total / Rsh_total) / (n2 * Ns * Vt)) - 1)
+        Idi = Isi * (np.exp((voltage + voltage * Rs_total / Rsh_total) / (ni * Ns * Vt)) - 1)  # Interface defects contribution
+
+        # Total diode current
+        Id = Id1 + Id2 + Idi
+
+        # Compute current considering resistances
+        I = (Iph * Rsh_total - Id * Rsh_total - voltage) / (Rsh_total + Rs_total)
+
+        # Recombination current including voltage-dependent defect model and contact resistance
+        I_rec = enhanced_recombination(voltage, temperature,Rs, Rsh, rho_contact,  A_cell_pv, aSi_thickness, TCO_resistivity, ni)
+        #print(I_rec)
+
+
+        # Calculate total current (subtract recombination losses)
+        I_total = I - I_rec   # Subtract recombination current from the total current
+
+        # Convergence check (stop if the difference between iterations is small)
+        if abs(Id - Id_prev) < 1e-3 :
+            break
+
+        Id_prev = Id
+
+    return I_total
+
+
+
+# PV model considering series/parallel configuration
+def pv_model_series(voltage, params, effective_irradiance, num_modules_series, num_modules_parallel):
+    single_module_voltage = voltage
+    single_module_current = pv_model(single_module_voltage, params, effective_irradiance,rho_contact,  A_cell_pv,aSi_thickness, TCO_resistivity, ni)
+    total_current = single_module_current * num_modules_parallel
+    total_voltage = single_module_voltage * num_modules_series
+    return total_current, total_voltage
+
+def perturb_observe_series(params, effective_irradiance, num_modules_series, num_modules_parallel, voltage_start=0, voltage_step=0.1):
+    voltages = []
+    currents = []
+    powers = []
+    resistances = []
+    voltage = voltage_start
+    mppt_index = 0  # Initialize mppt_index as an integer
+    max_power = 0
+
+    while True:
+        # Pass params_with_temp to pv_model_series
+        current, total_voltage = pv_model_series(voltage, params, effective_irradiance, num_modules_series, num_modules_parallel)
+        power_output = total_voltage * current
+        resistance = total_voltage / current if current != 0 else float('inf')
+
+        voltages.append(total_voltage)
+        currents.append(current)
+        powers.append(power_output)
+        resistances.append(resistance)
+
+        # Track the maximum power output and its index
+        if power_output > max_power:
+            max_power = power_output
+            mppt_index = len(powers) - 1  # Update mppt_index as an integer
+
+        if current <= 0:  # Stop when the current reaches zero
+            break
+
+        voltage += voltage_step
+
+    return voltages, currents, powers, mppt_index  # Return mppt_index as an integer
+
+# Find the MPPT point
+def find_mppt(voltages, currents, voltage_step=0.001):
+    voltage = np.array(voltages)
+    current = np.array(currents)
+    power = voltage * current
+    max_power_index = np.argmax(power)
+
+    left_voltage = voltage[max_power_index] - voltage_step
+    right_voltage = voltage[max_power_index] + voltage_step
+
+    left_power = left_voltage * current[max_power_index]
+    right_power = right_voltage * current[max_power_index]
+
+    if left_power > right_power:
+        new_voltage = left_voltage
+    else:
+        new_voltage = right_voltage
+
+    return voltage[max_power_index], current[max_power_index], power[max_power_index]
+
+# Example usage
+time_now = pd.Timestamp.now()  # Get the current time
+G = 1000  # Default global irradiance in W/m²
+
+effective_G = get_solar_irradiance(time_now, latitude, longitude, tilt_angle_deg, G)
+
+print(f"Effective Irradiance at {time_now}: {effective_G} W/m²")
+
+#________________________________________PEM Modeling_______________________________________________________________________
+# Constants
+
+def V_cell(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_ref, i_lim):
+
+    #Global constants
+    R = 8.314  # Gas constant in J/(mol·K)
+    F= 9.648e+4
+    # Constants
+
+    k1 = 8.5e-4
+    k2 = R//(F)
+    k3 = 6.1078e-3
+    k4 = 17.694
+    k5 = 34.85
+    k6 = 0.1113
+    k7 = 3.26e-3
+    k8 = 1268
+    k9 = R/F
+
+    # Intermediate calculations
+    Erev = 1.229 - k1 * (T - 298.15) + ((k2/2) * T * np.log(((p_cat - k3 * np.exp(k4 * ((T - 273.15) / (T - k5)))) * np.square(p_an - k3 * np.exp(k4 * ((T - 273.15) / (T - k5))))) / (k3 * np.exp(k4 * ((T - 273.15) / (T - k5))))))
+
+    Vohm = δ_mem / (A_cell * k6 - k7 * np.exp(k8 * ((1 / 303) - (1 / T))))
+
+
+    Vact = ((k9 * T) / a_an) * np.log(i /i_0_an) + ((k9 * T) / a_cat) * np.log((i + 1e-10) /(i_0_cat+ 1e-10))
+
+
+    Vcon = (((k2 * T) / 2*a_an) * np.log(i_lim/(i_lim-1) ))
+
+
+    # Cell voltage calculation
+    V_cell = Erev + Vohm + Vact + Vcon
+    #V_cell = 1.229 - k1 * (T - 298.15) + (k2 * T * np.log(ln_term)) + mem_term + (((k9 * T) / α_an) * sin_term) + (((k2 * T) / α_an) * np.log(ln_term2))
+
+
+    return V_cell
+
+def V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_ref, i_lim, num_cell_series):
+    return V_cell(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_ref, i_lim) * num_cell_series
+
+def I_PEM(i_cell, num_cell_parallel):
+    return i_cell * num_cell_parallel
+
+
+
+# Define the load fraction points and the corresponding efficiency values
+load_points = [0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.70, 0.8, 0.9, 1.0]  # Fractional loads (10%, 50%, 100%)
+efficiency_points = [0, 0.70, 0.705, 0.713, 0.72, 0.715, 0.705, 0.70, 0.695, 0.68, 0.67, 0.66]  # Efficiencies at corresponding loads
+
+
+#________________________________________Perameters_______________________________________________________________________
+
+
+# Example parameters
+params_base = [Iph_ref, Is_ref1, Is_ref2, Is_refi, Rs, Rsh, n1, n2, ni, rho_contact]  # Updated parameter list
+
+#T = 335.15  # K
+δ_mem =  0.0175  # Example value for membrane thickness
+A_cell = 500 # cm2  Example value for cell area
+a_an = 0.9# Example value for anode overpotential coefficient
+a_cat = 0.6
+i_0_an  = 1.0e-3   # IrO2 anode (well optimized)
+i_0_cat = 5.0e-2   # Pt cathode
+T_ref = 298.15  # Reference temperature in Kelvin
+i_lim = 6.1 # Example value for current limit
+
+p_cat = 35  # Example value for cathode pressure
+p_an = 1.0  # Example value for anode pressure
+i_cell = A_cell * 1  #---------------------------IMPORTANT!!!!!!!
+Faraday_constant = 96485
+LHV = 33.3*1000
+module_area= 0.5 #m2
+#efficiency = 0.69
+PEM_capacity=42000
+
+#____________________________________________________________________Optimization___________________________________________________________________________________________________________________
+
+import numpy as np
+
+def find_intersection_point(voltages_pv, currents_pv, voltages_pem, currents_pem):
+    """
+    Find the closest intersection point between PV and PEM voltage-current characteristics.
+    """
+    min_error = float('inf')
+    best_point = None
+
+    for v_pv, i_pv in zip(voltages_pv, currents_pv):
+        for v_pem, i_pem in zip(voltages_pem, currents_pem):
+            error = np.sqrt((v_pv - v_pem)**2 + (i_pv - i_pem)**2)  # Euclidean distance
+            if error < min_error:
+                min_error = error
+                best_point = (v_pv, i_pv)
+
+    return best_point  # Closest match
+
+from pymoo.core.problem import Problem
+from pymoo.core.variable import Integer
+import numpy as np
+
+class PV_PEM_Optimization(Problem):
+
+    def __init__(self, params, irradiance, LHV, module_area, efficiency,
+                 tilt_angle_deg, sun_zenith_deg,
+                 p_cat, p_an, δ_mem, A_cell_pem, a_an, a_cat,
+                 i_0_an, i_0_cat, T_ref, i_lim,
+                 cost_pv_module=245, cost_pem_cell=1980):
+
+        # 4 design variables:
+        # 0: num_modules_series, 1: num_modules_parallel, 2: num_cell_series, 3: num_cell_parallel
+        n_var = 5
+        xl = np.array([2, 40, 42, 1, 330])  # Lower bounds
+        xu = np.array([2, 90, 42, 1, 360])  # Upper bounds
+        super().__init__(n_var=n_var,
+                         n_obj=4,   # Hydrogen, STH efficiency, Economic, Energy Loss - Changed from 3 to 4
+                         n_constr=1,  # PV-PEM matching
+                         xl=xl,
+                         xu=xu,
+                         type_var=Integer)
+
+        self.params = params
+        self.irradiance = irradiance
+        #self.T = T
+        self.LHV = LHV
+        self.module_area = pv_module_area
+        self.efficiency = efficiency
+        self.tilt_angle_deg = tilt_angle_deg
+        self.sun_zenith_deg = sun_zenith_deg
+        self.p_cat = p_cat
+        self.p_an = p_an
+        self.δ_mem = δ_mem
+        self.A_cell_pem = A_cell_pem
+        self.a_an = a_an
+        self.a_cat = a_cat
+        self.i_0_an = i_0_an
+        self.i_0_cat = i_0_cat
+        self.T_ref = T_ref
+        self.i_lim = i_lim
+        self.cost_pv_module = cost_pv_module
+        self.cost_pem_cell = cost_pem_cell
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        n_samples = X.shape[0]
+        f1 = np.zeros(n_samples)  # Hydrogen production (maximize)
+        f2 = np.zeros(n_samples)  # STH efficiency (maximize)
+        f3 = np.zeros(n_samples)  # Economic objective (minimize cost)
+        f4 = np.zeros(n_samples) # Energy loss
+        g1 = np.zeros(n_samples)  # Constraint: PV voltage >= PEM voltage
+
+        for i, x in enumerate(X):
+            num_modules_series = int(x[0])
+            num_modules_parallel = int(x[1])
+            num_cell_series = int(x[2])
+            num_cell_parallel = int(x[3])
+            PEM_Temperature= int(x[4])
+
+            hydro_results, sth_results, cost_results, loss_results = [], [], [], []
+
+            # --- PV IV Curve ---
+            effective_irradiance = calculate_effective_irradiance(
+                irradiance, 0.1 * irradiance,
+                tilt_angle_deg,sun_zenith_deg
+            )
+            voltages_pv, currents_pv, powers_pv, mppt_index = perturb_observe_series(
+                params=params_base + [temperature], # params_base + current T for pv_model
+                effective_irradiance=effective_irradiance,
+                num_modules_series=num_modules_series,
+                num_modules_parallel=num_modules_parallel
+            )
+            mppt_voltage, mppt_current, mppt_power = find_mppt(voltages_pv, currents_pv)
+
+            # --- Generate PEM IV curve
+            pem_current_densities = np.linspace(0.01, I_PEM(i_cell, num_cell_parallel), 100)  # Current density (A/cm²)
+            # Use the parameters from the current hour's results (stored in the result dictionary)
+            pem_voltages = [V_PEM(temperature + 273.15, p_cat, p_an, δ_mem,
+                                  A_cell, a_an, a_cat,
+                                  i, i_0_an, i_0_cat,
+                                  T_ref, i_lim, num_cell_series)
+                            for i in pem_current_densities]
+
+
+
+            # --- Find intersection (operating point) ---
+            operating_point = find_intersection_point(voltages_pv, currents_pv, pem_voltages, pem_current_densities)
+            if not operating_point:
+                continue
+            operating_voltage, operating_current = operating_point
+
+            # Inside your loop where hydrogen_production is calculated
+            fractional_load = (operating_voltage * operating_current) / PEM_capacity
+
+            # Clip fractional load between 0 and 1 to avoid extrapolation
+            fractional_load = np.clip(fractional_load, 0, 1)
+
+            # Get the production efficiency from the piecewise curve
+            production_efficiency = np.interp(fractional_load, load_points, efficiency_points)
+
+            # Hydrogen production
+
+            if mppt_current>max(pem_current_densities):
+              H2_prod= 0
+            else:
+              H2_prod = (operating_voltage * operating_current * production_efficiency) / self.LHV
+            hydro_results.append(H2_prod)
+            #print(f"Fractional load: {fractional_load:.2f}, Production efficiency: {production_efficiency:.2f}, Hydrogen production: {H2_prod:.4f} kg")
+
+
+            # PV area
+            pv_area = num_modules_series * num_modules_parallel * self.module_area
+
+            # STH efficiency
+            if mppt_current>max(pem_current_densities):
+              sth_eff=0
+            else:
+              sth_eff = (H2_prod * self.LHV) / (self.irradiance * pv_area) if self.irradiance*pv_area>0 else 0
+            sth_results.append(sth_eff)
+
+            # Energy loss / economic: total CAPEX
+            pv_cost = num_modules_series * num_modules_parallel * self.cost_pv_module
+            pem_cost = (num_cell_series-2) * num_cell_parallel * self.cost_pem_cell
+            total_cost = pv_cost + pem_cost
+            r = 0.07       # discount rate (7%)
+            n = 20         # lifetime (years)
+            annual_OandM_fixed = 0.02 * total_cost  # example: 2% CAPEX per year
+            # Annuity factor
+            if r == 0:
+                annuity = 1.0 / n
+            else:
+                annuity = r / (1.0 - (1.0 + r) ** (-n))
+            # Annualized CAPEX
+            annualized_capex = total_cost * annuity
+            annual_H2 = H2_prod * 10*365
+            if H2_prod == 0:
+                cost_h2 = float('inf')  # or set to np.nan, or any placeholder
+            else:
+                cost_h2 = (annualized_capex + annual_OandM_fixed) / annual_H2
+            cost_results.append(total_cost)
+
+            #print(f"Annualized CAPEX: {annualized_capex:.0f} € / yr")
+            #print(f"Annual H2: {annual_H2:.1f} kg/yr")
+            #print(f"LCOH: {cost_h2:.3f} €/kg")
+
+            energy_losses = abs(mppt_power - operating_voltage * operating_current) # Use V_op, I_op from operating point
+            loss_results.append(energy_losses)
+
+
+
+            if hydro_results:
+                f1[i] = -np.mean(hydro_results)  # maximize
+                f2[i] = -np.mean(sth_results)    # maximize
+                f3[i] = np.mean(cost_results)   # minimize cost
+                f4[i] = np.mean(loss_results)
+            else:
+                f1[i] = f2[i] = f3[i] = f4[i] = np.inf
+
+            # Constraint: PV voltage should be >= PEM voltage
+            # This constraint needs to be evaluated based on the operating point, not just max currents
+            # For simplicity, if an operating point was found, we assume the constraint is met or set it to 0.
+            # If no operating point was found (e.g., due to 'continue'), then f1-f4 are inf and g1[i] should be inf as well.
+            # If an operating point was found, we set g1[i] = 0 as it's a feasibility constraint.
+            if not hydro_results: # If no hydro_results, then it was infeasible
+                g1[i] = np.inf
+            else:
+                g1[i] = 0 # If an operating point was found, the system is considered matched (feasible).
+
+        out["F"] = np.column_stack([f1, f2, f3, f4])
+        out["G"] = np.column_stack([g1])
+        
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.optimize import minimize
+from pymoo.termination import get_termination
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# Read irradiance values from Excel file
+df_irradiance = pd.read_excel('Irradiance_values_example.xlsx','Days')
+
+# Initialize an empty list to store all results
+all_results_flex = []
+
+# Group the data by day
+grouped = df_irradiance.groupby('Day')
+
+for day, group in grouped:
+
+    hourly_averaged_irradiance_values = group['Irradiance_Lund'].tolist()
+    hourly_averaged_temperature_values = group['Temperature_Lund'].tolist()
+
+    # Iterate through each hour of the day
+    for hour, (irradiance, temperature) in enumerate(zip(hourly_averaged_irradiance_values, hourly_averaged_temperature_values), 1):
+        print(f"Processing data for Day {day}, Hour {hour}, Irradiance = {irradiance} W/m², Ambient_T = {temperature}°C")
+
+        if irradiance<80:
+            H2 = 0,
+            StH = 0,
+            Cost=0,
+            Loss=0
+            continue
+
+        # Define the optimization problem instance for the current hour's conditions
+        problem = PV_PEM_Optimization(
+            params=params_base, # Changed from params_base + [temperature]
+            irradiance=irradiance,
+            #T=temperature + 273.15, # Convert to Kelvin
+            p_cat=p_cat,
+            p_an=p_an,
+            δ_mem=δ_mem,
+            A_cell_pem=A_cell, # Use A_cell from previous cells
+            a_an=a_an,
+            a_cat=a_cat,
+            i_0_an=i_0_an,
+            i_0_cat=i_0_cat,
+            T_ref=T_ref,
+            i_lim=i_lim,
+            LHV=LHV,
+            module_area=module_area,
+            efficiency=efficiency_points,
+            tilt_angle_deg=tilt_angle_deg,
+            sun_zenith_deg=sun_zenith_deg
+        )
+
+        # Initialize the NSGA-II algorithm
+        algorithm = NSGA2(
+            pop_size=100,
+            n_offsprings=60,
+            sampling=FloatRandomSampling(),
+            crossover=SBX(prob=0.9, eta=20),
+            mutation=PM(eta=20),
+            eliminate_duplicates=True
+        )
+
+        # Define termination criteria
+        termination = get_termination("n_evals", 60)
+
+        # Run the optimization
+        res = minimize(problem,
+                       algorithm,
+                       termination,
+                       #seed=1, # You might want to change the seed or remove it for different runs
+                       save_history=False, # No need to save history for each hour
+                       verbose=True) # Set to True if you want to see optimization progress for each hour
+
+        # Check if results are available and valid before processing
+        if res.F is not None and len(res.F) > 0:
+            # Print key results for this hour
+            print(f"🔍 Pareto front for Day {day}, Hour {hour}:")
+            for i, (f1, f2, f3, f4) in enumerate(res.F):
+                H2 = -f1                    # Remember: hydrogen production is minimized as -H2
+                StH = -f2
+                Cost = f3                  # Same for STH efficiency
+                Loss = f4
+
+                config = res.X[i]
+                print(f"  Solution {i+1}:")
+                print(f"    → Modules (series, parallel): {int(config[0])}, {int(config[1])}")
+                print(f"    → Cells (series, parallel):   {int(config[2])}, {int(config[3])}")
+                print(f"    → PEM_Temperature:{int(config[4])}°C")
+                print(f"    → Hydrogen Production: {H2:.4f} kg")
+                print(f"    → STH Efficiency:      {StH:.2%}")
+                print(f"    → Economic Cost:       {Cost/1000:.2f} kEuro")
+                print(f"    → Energy Losses:       {Loss/1000:.2f} kW")
+
+                num_modules_series = int(config[0])
+                num_modules_parallel = int(config[1])
+                num_cell_series = int(config[2])
+                num_cell_parallel = int(config[3])
+
+
+                # --- PV IV Curve ---
+                effective_irradiance = calculate_effective_irradiance(
+                    irradiance, 0.1 * irradiance,
+                    tilt_angle_deg,sun_zenith_deg
+                )
+                voltages_pv, currents_pv, powers_pv, mppt_index = perturb_observe_series(
+                    params=params_base + [temperature], # params_base + current T for pv_model
+                    effective_irradiance=effective_irradiance,
+                    num_modules_series=num_modules_series,
+                    num_modules_parallel=num_modules_parallel
+                )
+                mppt_voltage, mppt_current, mppt_power = find_mppt(voltages_pv, currents_pv)
+
+                # --- Generate PEM IV curve
+                pem_current_densities = np.linspace(0.01, I_PEM(i_cell, num_cell_parallel), 100)  # Current density (A/cm²)
+                # Use the parameters from the current hour's results (stored in the result dictionary)
+                pem_voltages = [V_PEM(temperature + 273.15, p_cat, p_an, δ_mem,
+                                      A_cell, a_an, a_cat,
+                                      i, i_0_an, i_0_cat,
+                                      T_ref, i_lim, num_cell_series)
+                                for i in pem_current_densities]
+
+
+
+                # --- Find intersection (operating point) ---
+                operating_point = find_intersection_point(voltages_pv, currents_pv, pem_voltages, pem_current_densities)
+                if not operating_point :
+                    H2 = 0,
+                    StH = 0,
+                    Cost=0,
+                    Loss=0
+
+
+                operating_voltage, operating_current = operating_point
+                print(operating_point)
+
+                # --- Plot IV Curves and Annotations ---
+                plt.figure(figsize=(8, 6))
+
+                plt.plot(voltages_pv, currents_pv, 'b-', linewidth=2, label='PV IV Curve')
+                plt.plot(pem_voltages, pem_current_densities, '--', color='black', linewidth=2, label='PEM IV Curve')
+
+                plt.scatter(mppt_voltage, mppt_current, color='red', s=80, edgecolors='black', zorder=5, label='MPPT Point')
+                plt.scatter(operating_voltage, operating_current, color='green', s=80, edgecolors='black', zorder=5, label='Operating Point')
+
+                plt.annotate(f"MPPT\n({mppt_voltage:.1f} V, {mppt_current:.1f} A)",
+                            xy=(mppt_voltage, mppt_current),
+                            xytext=(mppt_voltage + 20, mppt_current +20),
+                            arrowprops=dict(arrowstyle="->", color='black'),
+                            fontsize=11, color='red', weight='bold')
+
+                plt.annotate(f"Operating\n({operating_voltage:.1f} V, {operating_current:.1f} A)",
+                            xy=(operating_voltage, operating_current),
+                            xytext=(operating_voltage - 100, operating_current +40),
+                            arrowprops=dict(arrowstyle="->", color='black'),
+                            fontsize=11, color='green', weight='bold')
+
+                plt.xlabel('Voltage (V)', fontsize=13, fontweight='bold')
+                plt.ylabel('Current (A)', fontsize=13, fontweight='bold')
+                plt.title(f"Day {day}, Hour {hour} - Irradiance: {irradiance:.0f} W/m²\n"
+                          f"Config: Modules ({num_modules_series}, {num_modules_parallel}), Cells ({num_cell_series}, {num_cell_parallel})",
+                          fontsize=13, fontweight='bold')
+
+                #plt.xlim(0, max(max(voltages_pv), max(pem_voltages)) + 10)
+                # Set x-axis limit
+                x_max = max(max(np.array(voltages_pv)), max(pem_voltages)) + 20
+                plt.xlim(0, x_max)
+
+                # Set x-axis ticks every 20 units
+                plt.xticks(np.arange(0, x_max + 1, 10))
+                plt.ylim(0, max(max(currents_pv), max(pem_current_densities)) + 2)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.legend(loc='upper left', fontsize=10)
+                plt.tight_layout()
+                plt.show()
+
+
+            # Store the results along with the irradiance and temperature values
+            all_results_flex.append({
+                'day': day,
+                'hour': hour,
+                'irradiance': irradiance,
+                'temperature': temperature,
+                'pareto_front': res.F,
+                'pareto_solutions': res.X
+            })
+        else:
+            print(f"❌ No feasible solutions found for Day {day}, Hour {hour}.")
+
+
+print("\nOptimization process completed for all data points.")
+# You can now access all_results_flex to analyze the results for each hour
+# Example: print the number of results
+print(f"Number of optimization results stored: {len(all_results_flex)}")
+
+import json
+
+with open("nsga2_results.json", "w") as f:
+    json.dump(all_results_flex, f, indent=2, default=lambda x: x.tolist())
+
+import pandas as pd
+
+summary_data = []
+for r in all_results_flex:
+    for i, (f1, f2, f3, f4) in enumerate(r['pareto_front']):
+        summary_data.append({
+            "day": r['day'],
+            "hour": r['hour'],
+            "irradiance": r['irradiance'],
+            "temperature": r['temperature'],
+            "hydrogen_kg": -f1,
+            "sth_efficiency": -f2,
+            "cost": f3,
+            "losses": f4,
+            "modules_series": int(r['pareto_solutions'][i][0]),
+            "modules_parallel": int(r['pareto_solutions'][i][1]),
+            "cells_series": int(r['pareto_solutions'][i][2]),
+            "cells_parallel": int(r['pareto_solutions'][i][3]),
+            "pem_temperature": int(r['pareto_solutions'][i][4])
+        })
+
+df_summary = pd.DataFrame(summary_data)
+df_summary.to_csv("nsga2_summary.csv", index=False)
+print("Summary CSV saved to nsga2_summary.csv")
+
+
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Execution time: {elapsed_time/60} mins")
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+df_summary = pd.read_csv('nsga2_summary.csv')
+
+
+# ==============================
+# RECONSTRUCT RESULTS
+# ==============================
+grouped = df_summary.groupby(['day', 'hour', 'irradiance', 'temperature'])
+
+all_results_flex = []
+for name, group in grouped:
+    day, hour, irradiance, temperature = name
+
+    pareto_front_list = []
+    pareto_solutions_list = []
+
+    for _, row in group.iterrows():
+        pareto_front_list.append([
+            -row['hydrogen_kg'],
+            -row['sth_efficiency'],
+            row['cost'],
+            row['losses']
+        ])
+
+        pareto_solutions_list.append([
+            row['modules_series'],
+            row['modules_parallel'],
+            row['cells_series'],
+            row['cells_parallel'],
+            row['pem_temperature']
+        ])
+
+    all_results_flex.append({
+        "day": day,
+        "hour": hour,
+        "irradiance": irradiance,
+        "temperature": temperature,
+        "pareto_front": np.array(pareto_front_list),
+        "pareto_solutions": np.array(pareto_solutions_list)
+    })
+
+# ==============================
+# PLOTTING
+# ==============================
+plt.figure(figsize=(18, 20))
+
+# -----------------------------
+# Plot 1: Hydrogen vs STH
+ax1 = plt.subplot(3, 1, 1)
+for result in all_results_flex:
+    pf = result['pareto_front']
+    H2 = -pf[:, 0]
+    STH = -pf[:, 1] * 100
+
+    mask = (STH >= 14) & (STH <= 17)
+    ax1.scatter(
+        H2[mask],
+        STH[mask],
+        s=70,
+        label=f"Day {result['day']} – Hour {result['hour']}"
+    )
+
+ax1.set_title("Hydrogen Production vs STH Efficiency",fontsize = 16)
+ax1.set_xlabel("Hydrogen Production (kg)",fontsize = 16)
+ax1.set_ylabel("STH Efficiency (%)",fontsize = 16)
+ax1.set_ylim(14, 17)
+ax1.tick_params(axis='both')
+#ax1.legend(loc="upper left", bbox_to_anchor=(1.02, 1))
+ax1.grid(False)
+
+# -----------------------------
+# Plot 2: Hydrogen vs Losses
+ax2 = plt.subplot(3, 1, 2)
+for result in all_results_flex:
+    pf = result['pareto_front']
+    H2 = -pf[:, 0]
+    Loss = pf[:, 3] / 1000
+
+    ax2.scatter(
+        H2,
+        Loss,
+        s=70,
+        label=f"Day {result['day']} – Hour {result['hour']}"
+    )
+
+ax2.set_title("Hydrogen Production vs Energy Losses",fontsize = 16)
+ax2.set_xlabel("Hydrogen Production (kg)",fontsize = 16)
+ax2.set_ylabel("Energy Losses (kW)",fontsize = 16)
+ax2.tick_params(axis='both')
+#ax2.legend(loc="upper left", bbox_to_anchor=(1.02, 1))
+ax2.grid(False)
+
+# -----------------------------
+# Plot 3: STH vs Losses
+ax3 = plt.subplot(3, 1, 3)
+for result in all_results_flex:
+    pf = result['pareto_front']
+    STH = -pf[:, 1] * 100
+    Loss = pf[:, 3] / 1000
+
+    mask = (STH >= 14) & (STH <= 17)
+    ax3.scatter(
+        STH[mask],
+        Loss[mask],
+        s=70,
+        label=f"Day {result['day']} – Hour {result['hour']}"
+    )
+
+ax3.set_title("STH Efficiency vs Energy Losses",fontsize = 16)
+ax3.set_xlabel("STH Efficiency (%),",fontsize = 16)
+ax3.set_ylabel("Energy Losses (kW)",fontsize = 16)
+ax3.set_xlim(14, 17)
+ax3.tick_params(axis='both')
+#ax3.legend(loc="upper left", bbox_to_anchor=(1.02, 1))
+ax3.grid(False)
+
+# -----------------------------
+plt.tight_layout(rect=[0, 0, 0.85, 1])
+plt.savefig("Comparison_of_Pareto_PEM_flex_3plots.png", dpi=300)
+plt.show()
+
+#-------------------------------------------------------------------------------------------------
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter
+import pandas as pd
+
+# all_results_flex is already available from previous cell execution
+
+PLOT_WEIGHTS = True
+SAVE_FIG_PREFIX = "mcda_weights"
+
+# The conversion to numpy arrays is already handled during the reconstruction in the previous cell.
+# for res in all_results_flex:
+#     res["pareto_front"] = np.array(res["pareto_front"], dtype=float)
+#     if "pareto_solutions" in res:
+#         res["pareto_solutions"] = np.array(res["pareto_solutions"], dtype=float)
+
+
+# -----------------------------
+# USER: supply all_results_flex (list of dicts)
+# Each dict must contain:
+#  - 'pareto_front' : Nx4 array-like with [f1, f2, f3, f4]  (stored format: [-H2, -STH, +Cost, +Loss])
+#  - optional: 'pareto_solutions' (decision vectors) if you want to store solutions too
+#  - optional: 'irradiance' scalar (used for scenario grouping below)
+# -----------------------------
+
+# -----------------------------
+# Constants / Objective indices
+# Stored objective format: [f1, f2, f3, f4] =
+#   [-H2, -STH, +Cost, +Loss]
+OBJ_H2 = 0
+OBJ_STH = 1
+OBJ_COST = 2
+OBJ_LOSS = 3
+M = 4
+EPS = 1e-12
+VIKOR_V = 0.5
+
+# -----------------------------
+# Helper: convert stored objective vector to "maximize" form
+def to_maximize_array(arr):
+    # arr: (...,4)
+    a = np.array(arr, dtype=float)
+    # invert where necessary so larger = better
+    a_max = a.copy()
+    a_max[..., OBJ_H2] = -a[..., OBJ_H2]
+    a_max[..., OBJ_STH] = -a[..., OBJ_STH]
+    a_max[..., OBJ_COST] = -a[..., OBJ_COST]   # cost invert -> lower cost becomes larger after invert
+    a_max[..., OBJ_LOSS] = -a[..., OBJ_LOSS]
+    return a_max
+
+# -----------------------------
+# Build global ranges using all pareto points
+all_maximize = []
+for res in all_results_flex:
+    pf = res.get('pareto_front', None)
+    if pf is None:
+        continue
+    pf = np.array(pf, dtype=float)
+    if pf.size == 0:
+        continue
+    all_maximize.append(to_maximize_array(pf))
+if len(all_maximize) == 0:
+    raise RuntimeError("No pareto_front data found in all_results_flex.")
+all_maximize = np.vstack(all_maximize).reshape(-1, M)
+
+global_min = np.nanmin(all_maximize, axis=0)
+global_max = np.nanmax(all_maximize, axis=0)
+global_range = global_max - global_min
+global_range[global_range == 0] = EPS
+
+# -----------------------------
+# prepare X_norm for a given pareto front using global scaling (0..1, higher better)
+def prepare_objectives_global(pareto_front):
+    P = np.array(pareto_front, dtype=float)
+    P_max = to_maximize_array(P)   # Nx4 with maximize orientation
+    X_norm = (P_max - global_min) / global_range
+    # clip small numerical out-of-bounds
+    X_norm = np.clip(X_norm, 0.0, 1.0)
+    return X_norm
+
+# -----------------------------
+# CRITIC weights (robust)
+def critic_weights(X_norm):
+    # X_norm: NxM (higher better)
+    # std
+    std = np.nanstd(X_norm, axis=0, ddof=0)
+    # correlation: handle degenerate by using np.nan_to_num
+    with np.errstate(invalid='ignore'):
+        corr = np.corrcoef(X_norm, rowvar=False)
+    if corr.shape != (M, M):
+        # degenerate: fallback
+        corr = np.eye(M)
+    if np.isnan(corr).any():
+        corr = np.nan_to_num(corr, nan=0.0)
+    # conflict measure
+    conflict = np.sum(1.0 - corr, axis=0)
+    C = std * conflict
+    if np.allclose(C, 0):
+        return np.ones(M) / M
+    weights = C / (np.sum(C) + EPS)
+    return weights
+
+# -----------------------------
+# TOPSIS, VIKOR, Fuzzy implementations (operate on X_norm)
+def topsis_rank(X_norm, weights):
+    W = np.asarray(weights)
+    V = X_norm * W
+    ideal = np.max(V, axis=0)
+    nadir = np.min(V, axis=0)
+    D_plus = np.linalg.norm(V - ideal, axis=1)
+    D_minus = np.linalg.norm(V - nadir, axis=1)
+    C = D_minus / (D_plus + D_minus + EPS)
+    order = np.argsort(-C)
+    return C, order
+
+def vikor_rank(X_norm, weights, v=VIKOR_V):
+    W = np.asarray(weights)
+    ideal = np.max(X_norm, axis=0)
+    nadir = np.min(X_norm, axis=0)
+    denom = ideal - nadir
+    denom[denom == 0] = EPS
+    diff = (ideal - X_norm) / denom
+    S = np.sum(W * diff, axis=1)
+    R = np.max(W * diff, axis=1)
+    S_min, S_max = np.min(S), np.max(S)
+    R_min, R_max = np.min(R), np.max(R)
+    S_range = S_max - S_min if S_max - S_min != 0 else EPS
+    R_range = R_max - R_min if R_max - R_min != 0 else EPS
+    Q = v * (S - S_min) / S_range + (1 - v) * (R - R_min) / R_range
+    order = np.argsort(Q)
+    return Q, order
+
+def fuzzy_score(X_norm, weights):
+    W = np.asarray(weights)
+    scores = X_norm.dot(W)
+    order = np.argsort(-scores)
+    return scores, order
+
+# -----------------------------
+# MAIN loop: compute per-episode MCDA winners and CRITIC weights
+critic_weights_all = []
+fuzzy_best_idx = []
+topsis_best_idx = []
+vikor_best_idx = []
+critic_best_idx = []
+hybrid_best_idx = []
+method_scores_storage = []
+
+for r in all_results_flex:
+    pf = r.get('pareto_front', None)
+    if pf is None or len(pf) == 0:
+        # fill placeholders
+        r['critic_weights'] = np.array([np.nan]*M)
+        r['fuzzy_best_index'] = None
+        r['topsis_best_index'] = None
+        r['vikor_best_index'] = None
+        r['critic_best_index'] = None
+        r['hybrid_best_index'] = None
+        continue
+
+    X_norm = prepare_objectives_global(pf)  # Nx4 normalized globally
+
+    # CRITIC weights for this front
+    w = critic_weights(X_norm)
+    r['critic_weights'] = w
+    critic_weights_all.append(w)
+
+    # CRITIC selection: compute weighted score on X_norm (not raw)
+    weighted_scores_critic = X_norm.dot(w)
+    best_idx_critic = int(np.nanargmax(weighted_scores_critic))
+    r['critic_best_index'] = best_idx_critic
+    r['critic_best_solution'] = r.get('pareto_solutions', [None]*len(pf))[best_idx_critic]
+    r['critic_best_objectives'] = r['pareto_front'][best_idx_critic]
+    critic_best_idx.append(best_idx_critic)
+
+    # Apply TOPSIS / VIKOR / Fuzzy using same weights and X_norm
+    fuzzy_scores, fuzzy_order = fuzzy_score(X_norm, w)
+    topsis_scores, topsis_order = topsis_rank(X_norm, w)
+    vikor_scores, vikor_order = vikor_rank(X_norm, w)
+
+    idx_fuzzy = int(fuzzy_order[0])
+    idx_topsis = int(topsis_order[0])
+    idx_vikor = int(vikor_order[0])
+
+    r['fuzzy_best_index'] = idx_fuzzy
+    r['topsis_best_index'] = idx_topsis
+    r['vikor_best_index'] = idx_vikor
+
+    r['fuzzy_best_solution'] = r.get('pareto_solutions', [None]*len(pf))[idx_fuzzy]
+    r['topsis_best_solution'] = r.get('pareto_solutions', [None]*len(pf))[idx_topsis]
+    r['vikor_best_solution'] = r.get('pareto_solutions', [None]*len(pf))[idx_vikor]
+
+    r['fuzzy_best_objectives'] = r['pareto_front'][idx_fuzzy]
+    r['topsis_best_objectives'] = r['pareto_front'][idx_topsis]
+    r['vikor_best_objectives'] = r['pareto_front'][idx_vikor]
+
+    # Hybrid majority vote (fuzzy, topsis, vikor). Tie-break by highest TOPSIS closeness
+    votes = [idx_fuzzy, idx_topsis, idx_vikor]
+    counts = Counter(votes)
+    most = counts.most_common()
+    top_count = most[0][1]
+    tied = [it for it, ct in most if ct == top_count]
+    if len(tied) == 1:
+        final_idx = tied[0]
+    else:
+        # choose tied alternative with highest topsis score C
+        final_idx = max(tied, key=lambda ix: topsis_scores[ix])
+    r['hybrid_best_index'] = int(final_idx)
+    r['hybrid_best_solution'] = r.get('pareto_solutions', [None]*len(pf))[final_idx]
+    r['hybrid_best_objectives'] = r['pareto_front'][final_idx]
+
+    hybrid_best_idx.append(final_idx)
+
+    method_scores_storage.append({
+        'fuzzy_scores': fuzzy_scores,
+        'topsis_scores': topsis_scores,
+        'vikor_Q': vikor_scores
+    })
+
+# finalize average CRITIC weights
+if critic_weights_all:
+    critic_weights_all = np.array(critic_weights_all)
+    average_critic_weights = np.nanmean(critic_weights_all, axis=0)
+else:
+    average_critic_weights = np.array([np.nan]*M)
+
+print("Average CRITIC weights (H2, STH, COST, LOSS):", np.round(average_critic_weights, 4))
+
+# -----------------------------
+# DERIVE weights from each MCDA winner (per-episode) using global scaling
+def derive_weights_from_obj_vector(obj_vector):
+    # obj_vector is stored format [-H2, -STH, +Cost, +Loss]
+    v = to_maximize_array(obj_vector)
+    norm = (v - global_min) / global_range
+    norm = np.clip(norm, 0.0, 1.0)
+    if np.allclose(norm, 0):
+        return np.ones(M) / M
+    w = norm / (np.sum(norm) + EPS)
+    return w
+
+fuzzy_weights_list = []
+topsis_weights_list = []
+
+for r in all_results_flex:
+    fo = r.get('fuzzy_best_objectives', None)
+    to = r.get('topsis_best_objectives', None)
+    if fo is not None:
+        w = derive_weights_from_obj_vector(fo)
+        fuzzy_weights_list.append(w)
+        r['fuzzy_derived_weights'] = w
+    if to is not None:
+        w = derive_weights_from_obj_vector(to)
+        topsis_weights_list.append(w)
+        r['topsis_derived_weights'] = w
+
+fuzzy_weights_arr = np.array(fuzzy_weights_list) if fuzzy_weights_list else np.empty((0, M))
+topsis_weights_arr = np.array(topsis_weights_list) if topsis_weights_list else np.empty((0, M))
+
+fuzzy_avg = np.nanmean(fuzzy_weights_arr, axis=0) if fuzzy_weights_arr.size else np.array([np.nan]*M)
+topsis_avg = np.nanmean(topsis_weights_arr, axis=0) if topsis_weights_arr.size else np.array([np.nan]*M)
+
+print("FUZZY-derived average weights:", np.round(fuzzy_avg,4), " (n={})".format(fuzzy_weights_arr.shape[0]))
+print("TOPSIS-derived average weights:", np.round(topsis_avg,4), " (n={})".format(topsis_weights_arr.shape[0]))
+
+# -----------------------------
+# VALIDATION: group episodes into irradiance scenarios (low/med/high) and compute stability table
+# If your results already include a 'scenario' key, you may use that instead of irradiance bins.
+irr_vals = np.array([res.get('irradiance', np.nan) for res in all_results_flex])
+# define bins on available irradiance percentiles
+valid_mask = ~np.isnan(irr_vals)
+if np.sum(valid_mask) >= 3:
+    p33, p66 = np.nanpercentile(irr_vals[valid_mask], [33, 66])
+else:
+    # fallback simple bins
+    p33, p66 = np.nanmin(irr_vals), np.nanmax(irr_vals)
+
+def scenario_label(irr):
+    if np.isnan(irr): return 'unknown'
+    if irr <= p33: return 'low'
+    if irr <= p66: return 'medium'
+    return 'high'
+
+scenarios = {'low': [], 'medium': [], 'high': []}
+
+# collect derived weights per scenario and method
+for res in all_results_flex:
+    lab = scenario_label(res.get('irradiance', np.nan))
+    if lab == 'unknown': continue
+    if 'fuzzy_derived_weights' in res:
+        scenarios[lab].append(('fuzzy', res['fuzzy_derived_weights']))
+    if 'topsis_derived_weights' in res:
+        scenarios[lab].append(('topsis', res['topsis_derived_weights']))
+
+# build table rows
+rows = []
+for lab in ['low','medium','high']:
+    # collect arrays
+    fuzzy_ws = [w for method,w in scenarios[lab] if method=='fuzzy']
+    topsis_ws = [w for method,w in scenarios[lab] if method=='topsis']
+    def summarize(arr):
+        if len(arr)==0:
+            return (np.array([np.nan]*M), np.array([np.nan]*M))
+        A = np.vstack(arr)
+        return np.nanmean(A,axis=0), np.nanstd(A,axis=0)
+    f_mean, f_std = summarize(fuzzy_ws)
+    t_mean, t_std = summarize(topsis_ws)
+    # stability check: each method compared to its overall mean, max delta < 0.05 (5%)
+    def stable(mean_arr, overall_arr):
+        if np.isnan(mean_arr).any() or np.isnan(overall_arr).any(): return False
+        return np.max(np.abs(mean_arr - overall_arr)) < 0.05
+    rows.append({
+        'scenario': lab,
+        'method': 'FUZZY',
+        'mean': f_mean,
+        'std': f_std,
+        'n': len(fuzzy_ws),
+        'stable': stable(f_mean, fuzzy_avg)
+    })
+    rows.append({
+        'scenario': lab,
+        'method': 'TOPSIS',
+        'mean': t_mean,
+        'std': t_std,
+        'n': len(topsis_ws),
+        'stable': stable(t_mean, topsis_avg)
+    })
+
+# present DataFrame
+df_rows = []
+for r in rows:
+    mean = r['mean']
+    std = r['std']
+    df_rows.append({
+        'Scenario': r['scenario'],
+        'Method': r['method'],
+        'n': r['n'],
+        'w_H2_mean': np.round(mean[0],4),
+        'w_H2_std': np.round(std[0],4),
+        'w_STH_mean': np.round(mean[1],4),
+        'w_STH_std': np.round(std[1],4),
+        'w_COST_mean': np.round(mean[2],4),
+        'w_COST_std': np.round(std[2],4),
+        'w_LOSS_mean': np.round(mean[3],4),
+        'w_LOSS__std': np.round(std[3],4),
+        'Stable(<0.05_all)': r['stable']
+    })
+df = pd.DataFrame(df_rows)
+print("\nWeight stability table (grouped by irradiance scenario):")
+print(df.to_string(index=False))
+
+# Optionally save as CSV for inclusion in manuscript
+df.to_csv("mcda_weight_stability_table.csv", index=False)
+print("\nSaved mcda_weight_stability_table.csv")
+
+# Optional: show small table of first N per-episode weights for inspection
+N = 5
+# --- Compute final aggregated weights across all episodes ---
+if fuzzy_weights_arr.size:
+    fuzzy_weights_final = np.mean(fuzzy_weights_arr, axis=0)
+    print("\nFinal Fuzzy Weights (averaged across episodes):")
+    print(fuzzy_weights_final)
+
+if topsis_weights_arr.size:
+    topsis_weights_final = np.mean(topsis_weights_arr, axis=0)
+    print("\nFinal TOPSIS Weights (averaged across episodes):")
+    print(topsis_weights_final)
+
+# finalize average weights
+if len(critic_weights_all) > 0:
+    critic_weights_all = np.array(critic_weights_all)
+    average_weights = np.nanmean(critic_weights_all, axis=0)
+else:
+    average_weights = np.array([np.nan, np.nan, np.nan, np.nan])
+
+w_H2, w_STH, w_COST, w_LOSS = average_weights
+print("\n🎯 CRITIC average objective weights (order = [H2, STH, Cost, Loss]):")
+print(average_weights)
+print(f"H2={w_H2:.3f}, STH={w_STH:.3f}, COST={w_COST:.3f}, LOSS={w_LOSS:.3f}")
+
+# -----------------------------
+# Optional: Visualize weight distribution
+# -----------------------------
+if PLOT_WEIGHTS and len(critic_weights_all) > 0:
+    # Boxplot of per-front weights
+    plt.figure(figsize=(6,4))
+    labels = ['H2','STH','COST','LOSS']
+    plt.boxplot(critic_weights_all, labels=labels, showmeans=True)
+    plt.title('Weights distribution across Pareto fronts (4 Objectives)')
+    plt.ylabel('Objectives weight')
+    plt.grid(axis='y', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_FIG_PREFIX}_boxplot.png", dpi=150)
+    print(f"Saved weight boxplot: {SAVE_FIG_PREFIX}_boxplot.png")
+
+    # Radar chart (average weights)
+    # Prepare data for radar
+    avg = average_weights
+    # duplicate first value to close the polygon
+    radar_vals = np.concatenate([avg, avg[:1]])
+    angles = np.linspace(0, 2*np.pi, len(avg)+1, endpoint=True)
+
+    fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(6,6))
+    ax.plot(angles, radar_vals, linewidth=2)
+    ax.fill(angles, radar_vals, alpha=0.25)
+    ax.set_thetagrids(np.degrees(angles[:-1]), labels)
+    ax.set_ylim(0, np.max([1.0, np.max(avg)*1.1]))
+    ax.set_title('Average CRITIC Weights (radar)')
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_FIG_PREFIX}_radar_new.png", dpi=150)
+    print(f"Saved radar chart: {SAVE_FIG_PREFIX}_radar_new.png")
+    
+#--------------------------------------------------------------------------------------------------------
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- 3D Pareto Front Plot with Losses as Z and Cost as color, Temperature as size ---
+fig = plt.figure(figsize=(12, 9))
+ax = fig.add_subplot(111, projection='3d')
+
+# Collect data for all points for proper scaling of temperature and cost
+all_H2 = []
+all_STH = []
+all_Loss = []
+all_Cost = []
+all_PEM_Temp = []
+
+for result in all_results_flex:
+    if 'pareto_front' not in result or 'pareto_solutions' not in result:
+        continue
+
+    pareto_front = np.array(result['pareto_front'])
+    pareto_solutions = np.array(result['pareto_solutions'])
+
+    H2 = -pareto_front[:, 0]    # Hydrogen Production
+    STH = -pareto_front[:, 1]*100   # STH Efficiency
+    Loss = pareto_front[:, 3]/1000   # Energy Losses (Z-axis)
+    Cost = pareto_front[:, 2] / 1000  # Economic Cost (for color), converted to k€
+    PEM_Temp = pareto_solutions[:, 4] # PEM Temperature (for size)
+
+    # -----------------------------
+    # Apply STH limits
+    mask = (STH >= 14) & (STH <= 18)
+    H2 = H2[mask]
+    STH = STH[mask]
+    Loss = Loss[mask]
+    Cost = Cost[mask]
+    PEM_Temp = PEM_Temp[mask]
+
+    all_H2.extend(H2)
+    all_STH.extend(STH)
+    all_Loss.extend(Loss)
+    all_Cost.extend(Cost)
+    all_PEM_Temp.extend(PEM_Temp)
+
+# Convert to numpy arrays
+all_H2 = np.array(all_H2)
+all_STH = np.array(all_STH)
+all_Loss = np.array(all_Loss)
+all_Cost = np.array(all_Cost)
+all_PEM_Temp = np.array(all_PEM_Temp)
+
+# Scale PEM_Temp for marker size
+# Normalize temperature to a range, e.g., 50 to 300 for better visual differentiation
+if all_PEM_Temp.size > 0 and np.nanmax(all_PEM_Temp) != np.nanmin(all_PEM_Temp):
+    scaled_temp_sizes = 50 + 250 * (all_PEM_Temp - np.nanmin(all_PEM_Temp)) / (np.nanmax(all_PEM_Temp) - np.nanmin(all_PEM_Temp))
+else:
+    scaled_temp_sizes = np.full_like(all_PEM_Temp, 100) # Default size if no variation or no data
+
+
+# Create a single scatter plot for all combined data
+sc = ax.scatter(
+    all_H2, all_STH, all_Loss,
+    c=all_Cost,             # Color represents Economic Cost
+    cmap='plasma',          # Heatmap for cost
+    s=scaled_temp_sizes,    # Size represents PEM Temperature
+    alpha=0.8,              # Transparency
+    edgecolors='w',         # White edges for better visibility
+    linewidth=0.5
+)
+
+# Colorbar for Economic Cost
+cbar_cost = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.1)
+cbar_cost.set_label('Configuration Cost (k€)', fontsize=12) # Updated label
+
+#ax.set_title('3D Pareto Front — H₂ Production, STH Efficiency, Energy Losses (Cost as color, PEM Temp as size)', fontsize=14)
+ax.set_xlabel('Hydrogen Production (kg)', fontsize=12)
+ax.set_ylabel('STH Efficiency (%)', fontsize=12)
+ax.set_zlabel('Energy Losses (kW)', fontsize=12)
+ax.grid(True)
+
+# Create a custom legend for temperature sizes
+# This is a bit more involved, creating dummy points for legend
+legend_handles = []
+legend_labels = []
+
+if all_PEM_Temp.size > 0:
+    # Choose representative temperature values for legend, e.g., min, median, max
+    temp_min = np.nanmin(all_PEM_Temp)
+    temp_max = np.nanmax(all_PEM_Temp)
+    temp_median = np.nanmedian(all_PEM_Temp)
+
+    # Corresponding scaled sizes
+    size_min = 50 + 250 * (temp_min - np.nanmin(all_PEM_Temp)) / (np.nanmax(all_PEM_Temp) - np.nanmin(all_PEM_Temp))
+    size_max = 50 + 250 * (temp_max - np.nanmin(all_PEM_Temp)) / (np.nanmax(all_PEM_Temp) - np.nanmin(all_PEM_Temp))
+    size_median = 50 + 250 * (temp_median - np.nanmin(all_PEM_Temp)) / (np.nanmax(all_PEM_Temp) - np.nanmin(all_PEM_Temp))
+
+    # Add dummy points to legend handles
+    legend_handles.append(ax.scatter([], [], [], s=size_min, c='gray', alpha=0.8, edgecolor='w', linewidth=0.5))
+    legend_labels.append(f'Temp: {temp_min:.0f} K')
+    legend_handles.append(ax.scatter([], [], [], s=size_median, c='gray', alpha=0.8, edgecolor='w', linewidth=0.5))
+    legend_labels.append(f'Temp: {temp_median:.0f} K')
+    legend_handles.append(ax.scatter([], [], [], s=size_max, c='gray', alpha=0.8, edgecolor='w', linewidth=0.5))
+    legend_labels.append(f'Temp: {temp_max:.0f} K')
+
+    # Add the custom size legend
+    ax.legend(handles=legend_handles, labels=legend_labels, title='PEM Temperature', loc='upper left')
+
+ax.view_init(elev=25, azim=135)
+plt.tight_layout()
+plt.savefig("3D_Pareto_Front_4_objectives.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+#-------------------------------------------------------------------------------------------------
+# --- Main VIKOR/Fuzzy/TOPSIS plot ---
+fig = plt.figure(figsize=(12, 9))
+ax = fig.add_subplot(111, projection='3d')
+
+labels_used = set()
+points_to_plot = []
+
+for result in all_results_flex:
+    if 'fuzzy_best_objectives' in result:
+        f = np.array(result['fuzzy_best_objectives'])
+        if not np.isnan(f).any():
+            points_to_plot.append((-f[0], -f[1]*100, f[3]/1000, f[2]/1000, "Fuzzy Optimal", '*', 350))
+    if 'topsis_best_objectives' in result:
+        t = np.array(result['topsis_best_objectives'])
+        if not np.isnan(t).any():
+            points_to_plot.append((-t[0], -t[1]*100, t[3]/1000, t[2]/1000, "TOPSIS Optimal", '^', 200))
+    if 'vikor_best_objectives' in result:
+        v = np.array(result['vikor_best_objectives'])
+        if not np.isnan(v).any():
+            points_to_plot.append((-v[0], -v[1]*100, v[3]/1000, v[2]/1000, "VIKOR Optimal", 's', 150))
+
+all_costs = np.array([p[3] for p in points_to_plot]) if points_to_plot else np.array([0])
+vmin, vmax = np.min(all_costs), np.max(all_costs)
+
+for (x, y, z, cost, label, marker, size) in points_to_plot:
+    ax.scatter(x, y, z, c=[cost], cmap='plasma', vmin=vmin, vmax=vmax,
+               marker=marker, s=size, edgecolor='black', linewidth=1.2,
+               zorder=50, label=label if label not in labels_used else None)
+    labels_used.add(label)
+
+sc_for_colorbar = ax.scatter([], [], [], c=[], cmap='plasma', vmin=vmin, vmax=vmax)
+cbar = plt.colorbar(sc_for_colorbar, ax=ax, shrink=0.6, pad=0.1)
+cbar.set_label("Economic Cost (k€)", fontsize=12)
+
+ax.set_xlabel("Hydrogen Production (kg)", fontsize=12)
+ax.set_ylabel("STH Efficiency (%)", fontsize=12)
+ax.set_zlabel("Energy Losses (kW)", fontsize=12)
+#ax.set_xlim(0.25, 20)
+ax.set_ylim(14, 17)  # <-- limit losses to 3 kW
+ax.set_zlim(0, 1.2)  # <-- limit losses to 3 kW
+ax.grid(True)
+ax.legend(fontsize=10, loc="upper left")
+ax.view_init(elev=25, azim=135)
+plt.tight_layout()
+plt.savefig("3D_Optimals_4_objectives.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+
+# --- Hybrid Optimal plot ---
+fig2 = plt.figure(figsize=(12,9))
+ax2 = fig2.add_subplot(111, projection='3d')
+
+hybrid_H2 = []
+hybrid_STH = []
+hybrid_Loss = []
+hybrid_Cost = []
+
+for result in all_results_flex:
+    if 'hybrid_best_objectives' in result:
+        h = np.array(result['hybrid_best_objectives'])
+        if not np.isnan(h).any():
+            hybrid_H2.append(-h[0])
+            hybrid_STH.append(-h[1]*100)
+            hybrid_Loss.append(h[3]/1000)
+            hybrid_Cost.append(h[2]/1000)
+
+hybrid_H2 = np.array(hybrid_H2)
+hybrid_STH = np.array(hybrid_STH)
+hybrid_Loss = np.array(hybrid_Loss)
+hybrid_Cost = np.array(hybrid_Cost)
+
+# Only plot if there's data
+if hybrid_H2.size > 0:
+    sc2 = ax2.scatter(hybrid_H2, hybrid_STH, hybrid_Loss,
+                        c=hybrid_Cost, cmap='viridis', s=300,
+                        edgecolor='black', linewidth=1.2)
+
+    cbar2 = plt.colorbar(sc2, ax=ax2, shrink=0.6, pad=0.1)
+    cbar2.set_label("Economic Cost (k€)", fontsize=12)
+else:
+    print("No hybrid optimal solutions found to plot for the second figure.")
+
+ax2.set_xlabel("Hydrogen Production (kg)", fontsize=12)
+ax2.set_ylabel("STH Efficiency (%)", fontsize=12)
+ax2.set_zlabel("Energy Losses (kW)", fontsize=12)
+ax2.set_ylim(14, 17)
+#ax2.set_zlim(0, 10)
+ax2.view_init(elev=25, azim=135)
+plt.tight_layout()
+plt.savefig("3D_Optimal_Solutions_4_objectives.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+#------------------------------------------------------------------------------------------
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- Extract MCDA solutions ---
+methods = ['fuzzy', 'topsis', 'vikor']
+markers = {'fuzzy':'*', 'topsis':'^', 'vikor':'s'}
+sizes = {'fuzzy':250, 'topsis':200, 'vikor':150}
+titles = {'fuzzy':'Fuzzy Logic', 'topsis':'TOPSIS', 'vikor':'VIKOR'}
+
+# Determine global color scale across all methods
+all_objectives = []
+for method in methods:
+    all_objectives.extend([-res[f'{method}_best_objectives'][0] if f'{method}_best_objectives' in res else np.nan for res in all_results_flex])
+all_objectives = np.array(all_objectives)
+c_min, c_max = np.nanmin(all_objectives), np.nanmax(all_objectives)
+
+# Create figure: 3 rows x 2 columns (PV strings / PEM temp)
+fig, axes = plt.subplots(3, 2, figsize=(14, 14), gridspec_kw={'hspace':0.35, 'wspace':0.25})
+
+for i, method in enumerate(methods):
+    # Extract data
+    PEM_T = np.array([res[f'{method}_best_solution'][4] if f'{method}_best_solution' in res else np.nan for res in all_results_flex])
+    PV_values = np.array([res[f'{method}_best_solution'][1] if f'{method}_best_solution' in res else np.nan for res in all_results_flex])
+    objectives = np.array([-res[f'{method}_best_objectives'][0] if f'{method}_best_objectives' in res else np.nan for res in all_results_flex])
+    irradiance_values = np.array([res['irradiance'] for res in all_results_flex])
+
+    # PV Strings scatter
+    sc_pv = axes[i, 0].scatter(
+        irradiance_values, PV_values,
+        c=objectives, cmap='Greens',
+        vmin=c_min, vmax=c_max,
+        marker=markers[method], s=sizes[method], edgecolors='black'
+    )
+    axes[i, 0].set_ylabel("PV Strings Connected in Parallel", fontsize=12)
+    axes[i, 0].set_title(titles[method], fontsize=14, fontweight='bold')
+    axes[i, 0].tick_params(axis='both', labelsize=12)
+    axes[i, 0].set_yticks(np.arange(40,91, 5))
+    axes[i, 0].grid(False)
+
+    # PEM Temperature scatter
+    sc_pem = axes[i, 1].scatter(
+        irradiance_values, PEM_T,
+        c=objectives, cmap='Greens',
+        vmin=c_min, vmax=c_max,
+        marker=markers[method], s=sizes[method], edgecolors='black'
+    )
+    axes[i, 1].set_ylabel("PEM Temperature (K)", fontsize=12)
+    axes[i, 1].tick_params(axis='both', labelsize=12)
+    axes[i, 1].set_ylim(330, 360)
+    axes[i, 1].yaxis.set_major_locator(plt.MultipleLocator(5))
+    axes[i, 1].grid(False)
+
+# X-axis labels only on bottom row
+axes[2, 0].set_xlabel("Irradiance (W/m²)", fontsize=14)
+axes[2, 1].set_xlabel("Irradiance (W/m²)", fontsize=14)
+
+# Colorbar for H2 production
+cbar = fig.colorbar(sc_pem, ax=axes, fraction=0.05, pad=0.02)
+cbar.set_label("H₂ Production (kg)", fontsize=14)
+cbar.ax.tick_params(labelsize=12)
+
+plt.tight_layout()
+plt.savefig("Scatter_MCDA_3methods_split_4_Obj.png", dpi=300, bbox_inches='tight')
+plt.show()
+
+#--------------------------------------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+
+# ==================================================
+# Extract Objective Performance for Aggregation (Copied from A2gQB7MjYHKk to resolve NameError)
+# ==================================================
+
+fuzzy_h2 = []; fuzzy_sth = []; fuzzy_losses = []; fuzzy_cost = []
+topsis_h2 = []; topsis_sth = []; topsis_losses = []; topsis_cost = []
+vikor_h2 = []; vikor_sth = []; vikor_losses = []; vikor_cost = []
+
+for result in all_results_flex:
+
+    if 'fuzzy_best_objectives' in result:
+        obj = np.array(result['fuzzy_best_objectives'])
+        fuzzy_h2.append(-obj[0]); fuzzy_sth.append(-obj[1])
+        fuzzy_losses.append(obj[3]/1000); fuzzy_cost.append(obj[2]/1000)
+    else:
+        fuzzy_h2.append(np.nan); fuzzy_sth.append(np.nan)
+        fuzzy_losses.append(np.nan); fuzzy_cost.append(np.nan)
+
+    if 'topsis_best_objectives' in result:
+        obj = np.array(result['topsis_best_objectives'])
+        topsis_h2.append(-obj[0]); topsis_sth.append(-obj[1])
+        topsis_losses.append(obj[3]/1000); topsis_cost.append(obj[2]/1000)
+    else:
+        topsis_h2.append(np.nan); topsis_sth.append(np.nan)
+        topsis_losses.append(np.nan); topsis_cost.append(np.nan)
+
+    if 'vikor_best_objectives' in result:
+        obj = np.array(result['vikor_best_objectives'])
+        vikor_h2.append(-obj[0]); vikor_sth.append(-obj[1])
+        vikor_losses.append(obj[3]/1000); vikor_cost.append(obj[2]/1000)
+    else:
+        vikor_h2.append(np.nan); vikor_sth.append(np.nan)
+        vikor_losses.append(np.nan); vikor_cost.append(np.nan)
+
+# Convert
+fuzzy_h2 = np.array(fuzzy_h2); fuzzy_sth = np.array(fuzzy_sth)
+fuzzy_losses = np.array(fuzzy_losses); fuzzy_cost = np.array(fuzzy_cost)
+
+topsis_h2 = np.array(topsis_h2); topsis_sth = np.array(topsis_sth)
+topsis_losses = np.array(topsis_losses); topsis_cost = np.array(topsis_cost)
+
+vikor_h2 = np.array(vikor_h2); vikor_sth = np.array(vikor_sth)
+vikor_losses = np.array(vikor_losses); vikor_cost = np.array(vikor_cost)
+
+# Define irradiance_values (Copied from pwD_lfw2JEtp to resolve NameError)
+irradiance_values = np.array([res['irradiance'] for res in all_results_flex])
+
+# -----------------------------
+# Prepare DataFrame
+# -----------------------------
+hybrid_df = pd.DataFrame({
+    'H2': vikor_h2,
+    'STH': vikor_sth,
+    'System Cost': vikor_cost,
+    'Losses': vikor_losses,
+    'Irradiance': irradiance_values
+})
+
+objective_names = hybrid_df.columns.tolist()
+
+# -----------------------------
+# Correlation Matrix
+# -----------------------------
+correlation_matrix = hybrid_df.corr()
+print("Correlation Matrix:\n", correlation_matrix)
+
+# Save correlation matrix as CSV
+correlation_matrix.to_csv("correlation_matrix_hybrid_4Obj.csv")
+
+
+hybrid_df_clean = hybrid_df.dropna()
+
+correlation_matrix = hybrid_df_clean.corr()
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(
+    correlation_matrix,
+    annot=True,
+    fmt=".2f",
+    cmap='RdBu_r',
+    center=0,
+    linewidths=0.8,
+    cbar_kws={"shrink": 0.8, "label": "Correlation"}
+)
+plt.title('Correlation Matrix of Hybrid Method (4 Objectives)', fontsize=14)
+plt.tight_layout()
+plt.show()
+
+
+# -----------------------------
+# Standardize data for PCA
+# -----------------------------
+scaler = StandardScaler()
+hybrid_scaled = scaler.fit_transform(hybrid_df)
+
+# -----------------------------
+# PCA (Principal Component Analysis)
+# -----------------------------
+pca = PCA()
+pca.fit(hybrid_scaled)
+explained = pca.explained_variance_ratio_
+print("Explained variance by each component (scaled):", explained)
+
+# PCA component loadings (contribution of each objective)
+components = pd.DataFrame(pca.components_, columns=objective_names)
+print("PCA Components (loadings):\n", components)
+
+# -----------------------------
+# Plot explained variance ratio
+# -----------------------------
+plt.figure(figsize=(8, 6))
+plt.bar(range(1, len(explained) + 1), explained, color='skyblue', edgecolor='black')
+plt.xticks(range(1, len(explained) + 1), [f'PC{i}' for i in range(1, len(explained)+1)])
+plt.ylabel('Explained Variance Ratio')
+plt.xlabel('Principal Components')
+plt.title('Explained Variance Ratio by Principal Component (Hybrid Method - Scaled)')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# Plot PCA loadings as a heatmap
+# -----------------------------
+plt.figure(figsize=(10,4))
+sns.heatmap(
+    components,
+    annot=True,
+    cmap='coolwarm',
+    center=0,
+    linewidths=0.8,
+    cbar_kws={"shrink":0.8, "label":"PCA Loading"}
+)
+plt.title('PCA Component Loadings (Scaled Data)', fontsize=14)
+plt.xlabel('Objectives')
+plt.ylabel('Principal Components')
+plt.tight_layout()
+plt.show()
+
+# ==================================================
+# Extract Objective Performance for Aggregation
+# ==================================================
+
+fuzzy_h2 = []; fuzzy_sth = []; fuzzy_losses = []; fuzzy_cost = []
+topsis_h2 = []; topsis_sth = []; topsis_losses = []; topsis_cost = []
+vikor_h2 = []; vikor_sth = []; vikor_losses = []; vikor_cost = []
+
+for result in all_results_flex:
+
+    if 'fuzzy_best_objectives' in result:
+        obj = np.array(result['fuzzy_best_objectives'])
+        fuzzy_h2.append(-obj[0]); fuzzy_sth.append(-obj[1])
+        fuzzy_losses.append(obj[3]/1000); fuzzy_cost.append(obj[2]/1000)
+    else:
+        fuzzy_h2.append(np.nan); fuzzy_sth.append(np.nan)
+        fuzzy_losses.append(np.nan); fuzzy_cost.append(np.nan)
+
+    if 'topsis_best_objectives' in result:
+        obj = np.array(result['topsis_best_objectives'])
+        topsis_h2.append(-obj[0]); topsis_sth.append(-obj[1])
+        topsis_losses.append(obj[3]/1000); topsis_cost.append(obj[2]/1000)
+    else:
+        topsis_h2.append(np.nan); topsis_sth.append(np.nan)
+        topsis_losses.append(np.nan); topsis_cost.append(np.nan)
+
+    if 'vikor_best_objectives' in result:
+        obj = np.array(result['vikor_best_objectives'])
+        vikor_h2.append(-obj[0]); vikor_sth.append(-obj[1])
+        vikor_losses.append(obj[3]/1000); vikor_cost.append(obj[2]/1000)
+    else:
+        vikor_h2.append(np.nan); vikor_sth.append(np.nan)
+        vikor_losses.append(np.nan); vikor_cost.append(np.nan)
+
+# Convert
+fuzzy_h2 = np.array(fuzzy_h2); fuzzy_sth = np.array(fuzzy_sth)
+fuzzy_losses = np.array(fuzzy_losses); fuzzy_cost = np.array(fuzzy_cost)
+
+topsis_h2 = np.array(topsis_h2); topsis_sth = np.array(topsis_sth)
+topsis_losses = np.array(topsis_losses); topsis_cost = np.array(topsis_cost)
+
+vikor_h2 = np.array(vikor_h2); vikor_sth = np.array(vikor_sth)
+vikor_losses = np.array(vikor_losses); vikor_cost = np.array(vikor_cost)
+
+
+# The calculation of critic_best_objectives has been moved to the MCDA loop in r0fG0GgHyTrY
+# This section now only extracts the results.
+
+critic_h2 = []
+critic_sth = []
+critic_losses = []
+critic_cost = []
+
+for result in all_results_flex:
+    if 'critic_best_objectives' in result:
+        obj = np.array(result['critic_best_objectives'])
+        critic_h2.append(-obj[0])
+        critic_sth.append(-obj[1])
+        critic_losses.append(obj[3]/1000)
+        critic_cost.append(obj[2]/1000)
+    else:
+        critic_h2.append(np.nan)
+        critic_sth.append(np.nan)
+        critic_losses.append(np.nan)
+        critic_cost.append(np.nan)
+
+
+# ==================================================
+# Performance Summary
+# ==================================================
+def print_summary(name, h2, sth, losses, cost):
+    print(f"\n=== {name} ===")
+    print(f"Total H₂ Production: {np.nansum(h2):.4f} kg")
+    print(f"Average STH Efficiency: {np.nanmean(sth):.4f} %")
+    print(f"Total Energy Losses: {np.nansum(losses):.4f} kW")
+    print(f"Maximum Economic Cost: {np.nanmax(cost):.2f} k€")
+
+print_summary("Fuzzy", fuzzy_h2, fuzzy_sth, fuzzy_losses, fuzzy_cost)
+print_summary("TOPSIS", topsis_h2, topsis_sth, topsis_losses, topsis_cost)
+print_summary("VIKOR", vikor_h2, vikor_sth, vikor_losses, vikor_cost)
+print_summary("CRITIC-Hybrid", critic_h2, critic_sth, critic_losses, critic_cost)
+
