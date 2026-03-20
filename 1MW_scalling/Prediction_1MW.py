@@ -661,7 +661,7 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
         print(f"⚠️ Skipping optimization: Irradiance = {irradiance} W/m² is below threshold.")
         return (
             6,   # num_modules_series
-            548,  # num_modules_parallel
+            576,  # num_modules_parallel
             100,  # num_cell_series
             1,   # num_cell_parallel
             0,   # operating_voltage
@@ -698,7 +698,7 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
 
       # Iterate through possible configurations
         for num_modules_series in range(6, 7):  # Adjust as needed
-            for num_modules_parallel in range(260,549,36):  # Adjust as needed
+            for num_modules_parallel in range(288,577,36):  # Adjust as needed
                 effective_irradiance = calculate_effective_irradiance(irradiance,0.1*irradiance, tilt_angle_deg, sun_zenith_deg)
                 voltages, currents, powers, mppt_index = perturb_observe_series(
                 params_with_temp, effective_irradiance, num_modules_series=num_modules_series, num_modules_parallel=num_modules_parallel)
@@ -858,7 +858,7 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
 
 
 time_resolution = 60 * 60 # in sec
-efficiency = 0.75
+#efficiency = 0.75
 # Initialize variables to track the maximum configurations
 max_num_modules_series = 0
 max_num_modules_parallel = 0
@@ -975,11 +975,19 @@ for day, group in grouped:
             voltages_pem = [V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, current, i_0_an, i_0_cat, T_ref, i_lim, num_cell_series) for current in current_range_pem]
 
             # Calculate hydrogen production
+            # Inside your loop where hydrogen_production is calculated
+            fractional_load = (operating_voltage * operating_current) / PEM_capacity
 
+            # Clip fractional load between 0 and 1 to avoid extrapolation
+            fractional_load = np.clip(fractional_load, 0, 1)
+
+            # Get the production efficiency from the piecewise curve
+            production_efficiency = np.interp(fractional_load, load_points, efficiency_points)
+            
             if  mppt_current >  np.max(current_range_pem) or irradiance < 80:
                 hydrogen_production=0
             else:
-                hydrogen_production = (operating_voltage * operating_current * efficiency) / (LHV)
+                hydrogen_production = (operating_voltage * operating_current * production_efficiency) / (LHV)
             print(f'In Day {day} and Hour {hour} the hydrogen production is {hydrogen_production}')
 
             net_hydrogen = hydrogen_production - hourly_hydrogen_target
