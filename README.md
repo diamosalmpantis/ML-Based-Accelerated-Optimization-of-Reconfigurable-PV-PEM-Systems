@@ -7,11 +7,11 @@ Directly coupling PV arrays with PEM electrolyzer stack requires precise configu
 
 * Sizing and Trade-off Analysis: Using NSGA-II to explore the feasible design space (PV strings and PEM temperature).
 
-* Real-Time Control: Replacing computationally expensive physics-based loops with a hybrid surrogate model that is up to 18x faster for yearly optimization.
+* Real-Time Control: Replacing computationally expensive physics-based loops with a hybrid surrogate model that is up to 6x faster for yearly optimization.
 
-📂 Repository Structure in kW system (similar in 1 MW scalling up)
+📂 Repository Structure in kW system 
 
-1. NSGA-II_application.py (Metaheuristic Optimization)
+1. NSGA-II_main.py (Metaheuristic Optimization)
 This script implements the NSGA-II algorithm to identify the Pareto-optimal front for the system.
 
 Degrees of Freedom: Number of parallel HJT PV strings and PEM operating temperature.
@@ -20,8 +20,7 @@ Objectives: Maximizing hydrogen production and STH efficiency while minimizing e
 
 Purpose: Systematic exploration of the search space without requiring predefined weighting factors.
 
-2. NSGA-II plots.py (Visualizations)
-A dedicated module for generating high-quality visualizations of the optimization results, including:
+Visualization: A dedicated module for generating high-quality visualizations of the optimization results, including:
 
 3D/2D Pareto Fronts: Illustrating the trade-offs between competing objectives.
 
@@ -29,21 +28,22 @@ Correlation Matrices: Analyzing the relationships between environmental inputs (
 
 MCDA Weight Distributions: Boxplots showing CRITIC-derived weight variability.
 
-3. Better_prediction_coupling.py (Hybrid Surrogate Model- Digital Twin)
-The core of the real-time decision framework. It maps environmental features directly to optimal system configurations and PEM operational temperature.
+2. Main_prediction.py (Hybrid Surrogate Model- Digital Twin)
 
 Machine Learning: Utilizes Random Forest Regression to predict PV configurations and PEM temperatures with the help of a k-d-tree acceleration.
 
-Reliability Filter: Employs a k-d tree-based nearest-neighbor search to verify prediction validity against the training database.
+Reliability Filter: Employs a k-d tree-based nearest-neighbor search to verify prediction validity against the training database and contains a evaluation ckeck with different statistical metrics
 
 Physical Logic: Incorporates rule-based feasibility checks to ensure valid operation under low irradiance or out-of-distribution conditions.
 
+📂 Repository Structure in 1MW_scalling
+Similar files to the KW_system but in this case testing for a 1MW PEM stack dicect coupled with HJT PV arrays
+
 💻 Performance Baseline
 All execution times and benchmarks were recorded on the following hardware:
-
 Processor: AMD Ryzen 9 7950X3D 16-Core Processor (4.20 GHz).
 
-Optimization Speedup: The surrogate model achieves an 18x speedup for annual horizons and a 900x speedup for next-day forecasts compared to the full physics-based model.
+Optimization Speedup: The surrogate model achieves an 6x speedup for annual horizons and a 200x speedup for next-day forecasts compared to the full physics-based model.
 
 📜 License
 
