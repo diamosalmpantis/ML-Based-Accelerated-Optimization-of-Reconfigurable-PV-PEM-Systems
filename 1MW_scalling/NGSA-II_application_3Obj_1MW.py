@@ -107,16 +107,6 @@ def bandgap_energy(T):
     # Example bandgap calculation, not involving calculate_is
     return Eg_ref * (1 - alpha * (T - T_ref))
 
-'''
-# Example correction for a circular recursion
-def calculate_is(temperature, Is_ref):
-    # Ensure bandgap_energy is calculated without calling calculate_is again
-    Eg_T = bandgap_energy(temperature)
-    # other calculations that don't involve recursion
-    Is = Is_ref * (Eg_T / Eg_ref)  # Adjust as per your model
-    return Is
-'''
-
 def calculate_iph(Iph_ref, G, T_ambient, G_ref=1000, T_ref=25, alpha_Isc=0.0005):
     return Iph_ref * (G / G_ref) * (1 + alpha_Isc * (T_ambient - T_ref))
 
@@ -161,7 +151,6 @@ def enhanced_recombination(voltage, temperature, Rs, Rsh, rho_contact, A_cell_pv
     # Defect current due to recombination
 
     defect_current = 1e-12
-
 
     # Recombination current using a more realistic approach
     recombination_current = defect_current * (voltage / R_total) * (1 + S / (TCO_resistivity * A_cell_pv))
@@ -225,7 +214,6 @@ def pv_model(voltage, params, effective_irradiance, rho_contact,  A_cell, aSi_th
         I_rec = enhanced_recombination(voltage, temperature,Rs, Rsh, rho_contact,  A_cell_pv, aSi_thickness, TCO_resistivity, ni)
         #print(I_rec)
 
-
         # Calculate total current (subtract recombination losses)
         I_total = I - I_rec   # Subtract recombination current from the total current
 
@@ -236,7 +224,6 @@ def pv_model(voltage, params, effective_irradiance, rho_contact,  A_cell, aSi_th
         Id_prev = Id
 
     return I_total
-
 
 
 # PV model considering series/parallel configuration
@@ -341,8 +328,6 @@ def V_cell(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_re
 
     # Cell voltage calculation
     V_cell = Erev + Vohm + Vact + Vcon
-    #V_cell = 1.229 - k1 * (T - 298.15) + (k2 * T * np.log(ln_term)) + mem_term + (((k9 * T) / α_an) * sin_term) + (((k2 * T) / α_an) * np.log(ln_term2))
-
 
     return V_cell
 
@@ -351,8 +336,6 @@ def V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_ref
 
 def I_PEM(i_cell, num_cell_parallel):
     return i_cell * num_cell_parallel
-
-
 
 # Define the load fraction points and the corresponding efficiency values
 load_points = [0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.70, 0.8, 0.9, 1.0]  # Fractional loads (10%, 50%, 100%)
@@ -381,8 +364,7 @@ i_cell = A_cell * 3  #---------------------------IMPORTANT!!!!!!!
 Faraday_constant = 96485
 LHV = 33.3*1000
 module_area= 0.5 #m2
-#efficiency = 0.69
-PEM_capacity=75000
+PEM_capacity=1000000
 
 #____________________________________________________________________Optimization___________________________________________________________________________________________________________________
 
@@ -561,11 +543,6 @@ class PV_PEM_Optimization(Problem):
             else:
                 f1[i] = f2[i] = f3[i]  = np.inf
 
-            # Constraint: PV voltage should be >= PEM voltage
-            # This constraint needs to be evaluated based on the operating point, not just max currents
-            # For simplicity, if an operating point was found, we assume the constraint is met or set it to 0.
-            # If no operating point was found (e.g., due to 'continue'), then f1-f4 are inf and g1[i] should be inf as well.
-            # If an operating point was found, we set g1[i] = 0 as it's a feasibility constraint.
             if not hydro_results: # If no hydro_results, then it was infeasible
                 g1[i] = np.inf
             else:
@@ -693,7 +670,6 @@ for day, group in grouped:
                                       i, i_0_an, i_0_cat,
                                       T_ref, i_lim, num_cell_series)
                                 for i in pem_current_densities]
-
 
 
                 # --- Find intersection (operating point) ---
@@ -935,25 +911,7 @@ import pandas as pd
 PLOT_WEIGHTS = True
 SAVE_FIG_PREFIX = "mcda_weights"
 
-# The conversion to numpy arrays is already handled during the reconstruction in the previous cell.
-# for res in all_results_flex:
-#     res["pareto_front"] = np.array(res["pareto_front"], dtype=float)
-#     if "pareto_solutions" in res:
-#         res["pareto_solutions"] = np.array(res["pareto_solutions"], dtype=float)
 
-
-# -----------------------------
-# USER: supply all_results_flex (list of dicts)
-# Each dict must contain:
-#  - 'pareto_front' : Nx4 array-like with [f1, f2, f3, f4]  (stored format: [-H2, -STH, +Cost, +Loss])
-#  - optional: 'pareto_solutions' (decision vectors) if you want to store solutions too
-#  - optional: 'irradiance' scalar (used for scenario grouping below)
-# -----------------------------
-
-# -----------------------------
-# Constants / Objective indices
-# Stored objective format: [f1, f2, f3, f4] =
-#   [-H2, -STH, +Cost, +Loss]
 OBJ_H2 = 0
 OBJ_STH = 1
 OBJ_LOSS = 2
