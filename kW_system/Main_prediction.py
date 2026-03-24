@@ -33,7 +33,7 @@ start_time = time.time()
 # --- Global variables ---
 X_data = []
 y_data = []
-cache_predictions = {}  # simple cache for repeated inputs
+cache_predictions = {}  
 model = None
 kdtree = None
 
@@ -83,7 +83,7 @@ def train_model():
         with open('config_predictor.pkl', 'wb') as f:
             pickle.dump(model, f)
         build_kdtree()
-        # 🗑️ Removed evaluate_model() from here so it only evaluates once at the very end!
+        
 
 # --- Evaluate and log model performance metrics ---
 def evaluate_model(X, y, model):
@@ -132,7 +132,6 @@ def evaluate_model(X, y, model):
         y_pred_test  = y_pred_full
         print(f"\n  ⚠️ Not enough samples for split — evaluating on full dataset ({len(X_arr)} samples)")
 
-    # T is at index 8, encoded as 0/1/2 → decode to 345/350/355 for display
     T_IDX = 8
     VALID_Ts = [345, 350, 355]
 
@@ -141,7 +140,7 @@ def evaluate_model(X, y, model):
         "num_cell_series", "num_cell_parallel",
         "operating_voltage", "operating_current",
         "mppt_voltage", "mppt_current",
-        "T (K) [classification]",   # ← label updated
+        "T (K) [classification]",  
         "hydrogen_production", "StH_efficiency"
     ]
 
@@ -273,8 +272,6 @@ def predict_configuration(input_features, irradiance_threshold=15, temperature_t
 #----------------------------------------------------------------------------------------------
 
 #________________________________________PV Modeling_______________________________________________________________________
-# Constants
-
 start_time = time.time()
 
 #________________________________________PV Modeling (https://www.solarelectricsupply.com/rec350aa-350w-rec-alpha-hjt-solar-panel)_______________________________________________________________________
@@ -349,15 +346,7 @@ def bifacial_gain(G, G_rear, bifaciality=0.9):
 def bandgap_energy(T):
     # Example bandgap calculation, not involving calculate_is
     return Eg_ref * (1 - alpha * (T - T_ref))
-'''
-# Example correction for a circular recursion
-def calculate_is(temperature, Is_ref):
-    # Ensure bandgap_energy is calculated without calling calculate_is again
-    Eg_T = bandgap_energy(temperature)
-    # other calculations that don't involve recursion
-    Is = Is_ref * (Eg_T / Eg_ref)  # Adjust as per your model
-    return Is
-'''
+    
 def calculate_iph(Iph_ref, G, T_ambient, G_ref=1000, T_ref=25, alpha_Isc=0.0005):
     return Iph_ref * (G / G_ref) * (1 + alpha_Isc * (T_ambient - T_ref))
 
@@ -468,8 +457,6 @@ def pv_model(voltage, params, irradiance, rho_contact,  A_cell, aSi_thickness,  
 
     return I_total
 
-
-
 # Function to compute solar position and adjust irradiance
 def get_solar_irradiance(time, latitude, longitude, tilt_angle_deg, G=1000):
     location = Location(latitude, longitude)
@@ -548,8 +535,6 @@ effective_G = get_solar_irradiance(time_now, latitude, longitude, tilt_angle_deg
 
 print(f"Effective Irradiance at {time_now}: {effective_G} W/m²")
 
-
-
 #________________________________________PEM Modeling_______________________________________________________________________
 # Constants
 
@@ -581,11 +566,8 @@ def V_cell(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_re
 
     Vcon = (((k2 * T) / 2*a_an) * np.log(i_lim/(i_lim-1) ))
 
-
     # Cell voltage calculation
     V_cell = Erev + Vohm + Vact + Vcon
-    #V_cell = 1.229 - k1 * (T - 298.15) + (k2 * T * np.log(ln_term)) + mem_term + (((k9 * T) / α_an) * sin_term) + (((k2 * T) / α_an) * np.log(ln_term2))
-
 
     return V_cell
 
@@ -594,9 +576,6 @@ def V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_ref
 
 def I_PEM(i_cell, num_cell_parallel):
     return i_cell * num_cell_parallel
-
-
-
 
 # Define the load fraction points and the corresponding efficiency values
 load_points = [0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.70, 0.8, 0.9, 1.0]  # Fractional loads (10%, 50%, 100%)
@@ -625,14 +604,12 @@ i_cell = A_cell * 1  #---------------------------IMPORTANT!!!!!!!
 Faraday_constant = 96485
 LHV = 33.3*1000
 module_area= 0.5 #m2
-#efficiency = 0.75
 PEM_capacity=42000
 #------------------------------------------------------------------------------------------------------------
 
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-
 
 def find_intersection_point(voltages_pv, currents_pv, voltages_pem, currents_pem):
     """
@@ -698,7 +675,7 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
     mppt_voltage, mppt_current = 0, 0
 
     # 🔁 Loop over PEM operating temperature
-    for T in range(345, 356, 5):  # 320 K to 360 K inclusive, step of 10
+    for T in range(345, 356, 5): 
         print(f"\n=== Evaluating PEM temperature: {T} K ===")
 
       # Iterate through possible configurations
@@ -808,9 +785,6 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
                         pem_cost = cost_per_pem_cell * num_cell_series * num_cell_parallel
                         total_capex = pv_cost + pem_cost
                         print(f'CAPEX is:',total_capex, 'Euros')
-                        #capex_per_hour=total_capex / (25*8760)
-                        #print(f'CAPEX_per_hour is:', capex_per_hour,'Euros/kg')
-                        #print(f'Hydrogen production is:', hydrogen_production)
 
 
                         # Normalize economic objective (for example, divide by max expected CAPEX to get 0-1 scale)
@@ -857,9 +831,6 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
 
     return best_configuration
 
-
-
-time_resolution = 60 * 60 # in sec
 # Initialize variables to track the maximum configurations
 max_num_modules_series = 0
 max_num_modules_parallel = 0
@@ -901,7 +872,6 @@ stored_hydrogen = 0     # persistent across days
 # Define pv_module_area here
 pv_module_area = 1.74 # m^2
 
-
 # Iterate through each day
 for day, group in grouped:
     hours_values = group['Hour'].tolist()
@@ -922,8 +892,7 @@ for day, group in grouped:
     total_hydrogen_production = 0
     total_losses_configuration = 0
     total_capex = 0
-    #stored_hydrogen = 0
-    #total_stored_hydrogen=0
+
 
     # Iterate through each hour of the day
     for entry in irradiance_temperature_mapping:
@@ -940,7 +909,6 @@ for day, group in grouped:
         pem_area = 0
         CAPEX = 0
         net_hydrogen = 0
-        #stored_hydrogen = 0 # This should not be re-initialized every hour
 
 
         params_with_temp = params_base + [temperature]
@@ -1027,8 +995,6 @@ for day, group in grouped:
                 StH_efficiency = (hydrogen_production*LHV)/(irradiance * pv_area)
             print(f'In Day {day} and Hour {hour} the StH is {StH_efficiency}')
 
-
-
             # Track the maximum values
             max_num_modules_series = max(max_num_modules_series, num_modules_series)
             max_num_modules_parallel = max(max_num_modules_parallel, num_modules_parallel)
@@ -1085,15 +1051,9 @@ for day, group in grouped:
             plt.show()
 
             # Append the results to the list
-
-            # PV capex 0.57-1 eur/W
             CAPEX_PV = 0.7*mppt_voltage*mppt_current #Euro
             CAPEX_EZ = 0.89*i_cell* num_cell_parallel*V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, current_range_pem, i_0_an, i_0_cat, T_ref, i_lim, num_cell_series)
-            # PV Opex 23.17 eur/kW
-            #OM_PV = CAPEX_PV*0.02 #Euro/year
-            #OM_EZ = CAPEX_EZ*0.02 #Euro/year
             CAPEX = CAPEX_PV+CAPEX_EZ
-            #TotalOM = OM_PV+OM_EZ
 
 
             # Update cumulative losses
@@ -1106,11 +1066,9 @@ for day, group in grouped:
             total_hydrogen_production += hydrogen_production
             total_capex += CAPEX
 
-
             #print(f'Total CAPEX for the installation in Day {day} is : {total_capex}')
 
             print('----------------------------------------------------------------------------------')
-
 
           # Append the results to the list
             results_flex.append([day,hour, irradiance, num_modules_series, num_modules_parallel, num_cell_series, num_cell_parallel, mppt_voltage,mppt_current,operating_voltage, operating_current,T,
@@ -1160,7 +1118,6 @@ for day, group in grouped:
         avg_pem_parallel = 0
         avg_irradiance = 0
 
-
     # Append results for this day to the list of all results
     all_results_flex.extend(results_flex)
 
@@ -1186,7 +1143,6 @@ for day, group in grouped:
     total_capex_days += (total_capex)
     total_hydrogen_production_days += (total_hydrogen_production)
     total_losses_days += (total_losses)
-
 
 # Calculate overall average of averages
 avg_pv_series_days = (round(sum(avg_pv_series_days) / len(grouped)))
