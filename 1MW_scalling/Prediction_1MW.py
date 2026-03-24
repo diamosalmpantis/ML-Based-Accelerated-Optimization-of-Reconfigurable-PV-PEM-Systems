@@ -345,16 +345,6 @@ def bandgap_energy(T):
     # Example bandgap calculation, not involving calculate_is
     return Eg_ref * (1 - alpha * (T - T_ref))
 
-'''
-# Example correction for a circular recursion
-def calculate_is(temperature, Is_ref):
-    # Ensure bandgap_energy is calculated without calling calculate_is again
-    Eg_T = bandgap_energy(temperature)
-    # other calculations that don't involve recursion
-    Is = Is_ref * (Eg_T / Eg_ref)  # Adjust as per your model
-    return Is
-'''
-
 def calculate_iph(Iph_ref, G, T_ambient, G_ref=1000, T_ref=25, alpha_Isc=0.0005):
     return Iph_ref * (G / G_ref) * (1 + alpha_Isc * (T_ambient - T_ref))
 
@@ -475,8 +465,6 @@ def pv_model(voltage, params, effective_irradiance, rho_contact,  A_cell, aSi_th
 
     return I_total
 
-
-
 # PV model considering series/parallel configuration
 def pv_model_series(voltage, params, effective_irradiance, num_modules_series, num_modules_parallel):
     single_module_voltage = voltage
@@ -579,8 +567,6 @@ def V_cell(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i, i_0_an, i_0_cat, T_re
 
     # Cell voltage calculation
     V_cell = Erev + Vohm + Vact + Vcon
-    #V_cell = 1.229 - k1 * (T - 298.15) + (k2 * T * np.log(ln_term)) + mem_term + (((k9 * T) / α_an) * sin_term) + (((k2 * T) / α_an) * np.log(ln_term2))
-
 
     return V_cell
 
@@ -598,7 +584,6 @@ efficiency_points = [0, 0.70, 0.735, 0.745, 0.75, 0.745, 0.735, 0.72, 0.705, 0.6
 
 
 #________________________________________Perameters_______________________________________________________________________
-
 
 # Example parameters
 params_base = [Iph_ref, Is_ref1, Is_ref2, Is_refi, Rs, Rsh, n1, n2, ni, rho_contact]  # Updated parameter list
@@ -793,9 +778,8 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
                             StH_efficiency = (hydrogen_production*LHV)/(irradiance * pv_area)
 
                         # Example economic parameters (you can adjust based on real data)
-                        cost_per_pv_module = 245      # $ per PV module (700/kW -> )
-                        cost_per_pem_cell = 1980        # $ per PEM cell (1800eur/kW -> )
-
+                        cost_per_pv_module = 315      # $ per PV module (700/kW -> )
+                        cost_per_pem_cell = 18000        # $ per PEM cell (1800eur/kW -> )
 
 
                         # Calculate economic objective
@@ -806,13 +790,9 @@ def optimize_pv_and_pem_configuration(params, irradiance, p_cat, p_an, δ_mem, A
                         pem_cost = cost_per_pem_cell * num_cell_series * num_cell_parallel
                         total_capex = pv_cost + pem_cost
                         print(f'CAPEX is:',total_capex, 'Euros')
-                        #capex_per_hour=total_capex / (25*8760)
-                        #print(f'CAPEX_per_hour is:', capex_per_hour,'Euros/kg')
-                        #print(f'Hydrogen production is:', hydrogen_production)
-
 
                         # Normalize economic objective (for example, divide by max expected CAPEX to get 0-1 scale)
-                        capex_norm = total_capex/ 1000000   # adjust 50000 to realistic max cost
+                        capex_norm = total_capex/ 2800000   
                         hydrogen_production_norm = hydrogen_production / 21
                         StH_efficiency_norm = StH_efficiency /  0.16
                         distance_to_mppt_norm = distance_to_mppt / 50
@@ -900,7 +880,6 @@ stored_hydrogen = 115     # persistent across days
 # Define pv_module_area here
 pv_module_area = 2.1 # m^2
 
-
 # Iterate through each day
 for day, group in grouped:
     hours_values = group['Hour'].tolist()
@@ -933,14 +912,13 @@ for day, group in grouped:
         # Initialize variables with default values for each hour
         num_modules_series, num_modules_parallel, num_cell_series, num_cell_parallel = 0, 0, 0, 0
         operating_voltage, operating_current, mppt_voltage, mppt_current = 0, 0, 0, 0
-        T, hydrogen_production, StH_efficiency, el_efficiency = 345, 0, 0, 0
+        T, hydrogen_production, StH_efficiency, el_efficiency = 335, 0, 0, 0
         hour_losses = 0
         pv_area = 0
         pem_area = 0
         CAPEX = 0
         net_hydrogen = 0
-        #stored_hydrogen = 0 # This should not be re-initialized every hour
-
+   
 
         params_with_temp = params_base + [temperature]
         best_configuration = optimize_pv_and_pem_configuration(params_with_temp, irradiance, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, i_0_an, i_0_cat,
@@ -1024,8 +1002,6 @@ for day, group in grouped:
             else:
                 StH_efficiency = (hydrogen_production*LHV)/(irradiance * pv_area)
 
-
-
             # Track the maximum values
             max_num_modules_series = max(max_num_modules_series, num_modules_series)
             max_num_modules_parallel = max(max_num_modules_parallel, num_modules_parallel)
@@ -1086,11 +1062,8 @@ for day, group in grouped:
             # PV capex 0.57-1 eur/W
             CAPEX_PV = 0.7*mppt_voltage*mppt_current #Euro
             CAPEX_EZ = 0.89*i_cell* num_cell_parallel*V_PEM(T, p_cat, p_an, δ_mem, A_cell, a_an, a_cat, current_range_pem, i_0_an, i_0_cat, T_ref, i_lim, num_cell_series)
-            # PV Opex 23.17 eur/kW
-            #OM_PV = CAPEX_PV*0.02 #Euro/year
-            #OM_EZ = CAPEX_EZ*0.02 #Euro/year
             CAPEX = CAPEX_PV+CAPEX_EZ
-            #TotalOM = OM_PV+OM_EZ
+          
 
 
             # Update cumulative losses
@@ -1102,9 +1075,6 @@ for day, group in grouped:
             total_pem_parallel += (num_cell_parallel)
             total_hydrogen_production += hydrogen_production
             total_capex += CAPEX
-
-
-            #print(f'Total CAPEX for the installation in Day {day} is : {total_capex}')
 
             print('----------------------------------------------------------------------------------')
 
