@@ -396,7 +396,7 @@ class PV_PEM_Optimization(Problem):
                  tilt_angle_deg, sun_zenith_deg,
                  p_cat, p_an, δ_mem, A_cell_pem, a_an, a_cat,
                  i_0_an, i_0_cat, T_ref, i_lim,
-                 cost_pv_module=245, cost_pem_cell=1980):
+                 cost_pv_module=315, cost_pem_cell=18000):
 
         # 4 design variables:
         # 0: num_modules_series, 1: num_modules_parallel, 2: num_cell_series, 3: num_cell_parallel
