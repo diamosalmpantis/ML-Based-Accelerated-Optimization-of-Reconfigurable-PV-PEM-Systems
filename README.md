@@ -46,10 +46,7 @@ Processor: AMD Ryzen 9 7950X3D 16-Core Processor (4.20 GHz).
 Optimization Speedup: The surrogate model achieves an 6x speedup for annual horizons and a 200x speedup for next-day forecasts compared to the full physics-based model.
 
 📜 License
-
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 📖 Citation
-If you use this code or methodology in your research, please cite:
-
-[DOI here]
+If you use this code or methodology in your research, please cite: https://doi.org/10.1016/j.renene.2026.125823
